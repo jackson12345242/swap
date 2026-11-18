@@ -117,7 +117,7 @@ class TicketView(discord.ui.View):
         if not ccies:
             return await i.response.send_message("Coin list is still loading, try again in a moment.", ephemeral=True)
         w = Wizard(i.user)
-        await i.response.send_message(embed=w.embed(), view=w, ephemeral=True)
+        await i.response.send_message(embed=w.embed(), view=w)
 
     @discord.ui.button(label="Close ticket", style=discord.ButtonStyle.grey, custom_id="ff:close")
     async def close(self, i: discord.Interaction, b):
@@ -253,7 +253,7 @@ class AddressModal(discord.ui.Modal):
 
 
 class Wizard(discord.ui.View):
-    """One ephemeral message that walks through: send coin -> receive coin -> amount -> address -> confirm."""
+    """One message in the ticket that walks through: send coin -> receive coin -> amount -> address -> confirm."""
     TITLES = {"send": "Step 1/4 · Choose the coin you SEND", "recv": "Step 2/4 · Choose the coin you RECEIVE",
               "amount": "Step 3/4 · How much do you want to send?", "address": "Step 4/4 · Where should we send it?",
               "confirm": "Confirm your swap"}
@@ -266,7 +266,10 @@ class Wizard(discord.ui.View):
         self.send = self.recv = self.amount = self.address = self.memo = self.est = None
         self.render()
 
-    async def interaction_check(self, i): return i.user.id == self.user.id
+    async def interaction_check(self, i):
+        if i.user.id == self.user.id: return True
+        await i.response.send_message("Only the ticket owner can use this menu.", ephemeral=True)
+        return False
 
     def dst(self): return next((c for c in ccies if c["code"] == self.recv), None)
 
