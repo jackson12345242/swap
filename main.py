@@ -3,7 +3,7 @@ Admin runs /setup once in the main channel -> panel with "Start a swap" button -
 channel -> menu (pick coins, enter details) -> confirm -> invoice -> live status + txids -> emergency button.
 Env: DISCORD_TOKEN, FF_API_KEY, FF_API_SECRET, DB_PATH (on your Railway volume), FF_RATE_TYPE (default float)
 """
-import os, hmac, hashlib, json, sqlite3, time, asyncio
+import os, re, hmac, hashlib, json, sqlite3, time, asyncio
 import aiohttp, discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -15,6 +15,7 @@ DB_PATH = os.getenv("DB_PATH", "/data/swaps.db")
 MAX_AGE = 3 * 86400      # stop polling orders older than this
 CLOSE_DELAY = 600        # seconds before a finished ticket channel is deleted
 FINAL = ("DONE", "EXPIRED")
+CHAT_INPUT = os.getenv("CHAT_INPUT", "1") == "1"  # type the USD amount in chat (needs Message Content Intent)
 TOS_TEXT = (
     "**By using this service you agree to the terms:** swaps are executed by a third party "
     "(FixedFloat). This bot never holds your funds. You are responsible for the receiving address, "
@@ -38,10 +39,13 @@ db.commit()
 
 class FFError(Exception): pass
 
-bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
+intents = discord.Intents.default()
+intents.message_content = CHAT_INPUT
+bot = commands.Bot(command_prefix="!", intents=intents)
 session: aiohttp.ClientSession
 ccies: list = []
 opening: set = set()
+waiting: dict = {}  # channel_id -> Wizard waiting for a typed USD amount
 
 
 async def ff(method, **params):
@@ -82,7 +86,8 @@ class PanelView(discord.ui.View):
             await i.response.defer(ephemeral=True)
             ow = {g.default_role: discord.PermissionOverwrite(view_channel=False),
                   g.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
-                                                    embed_links=True, manage_channels=True),
+                                                    embed_links=True, manage_channels=True,
+                                                    manage_messages=True),
                   i.user: discord.PermissionOverwrite(view_channel=True, send_messages=True,
                                                       read_message_history=True)}
             role = g.get_role(cfg[1]) if cfg[1] else None
@@ -116,7 +121,8 @@ class TicketView(discord.ui.View):
             return await i.response.send_message("This ticket already has a swap. Open a new ticket once it finishes.", ephemeral=True)
         if not ccies:
             return await i.response.send_message("Coin list is still loading, try again in a moment.", ephemeral=True)
-        w = Wizard(i.user)
+        w = Wizard(i.user, i.channel_id)
+        w.last_i = i
         await i.response.send_message(embed=w.embed(), view=w)
 
     @discord.ui.button(label="Close ticket", style=discord.ButtonStyle.grey, custom_id="ff:close")
@@ -203,29 +209,48 @@ class SearchModal(discord.ui.Modal):
         await w._go(i, w.step)
 
 
+def fmt(x): return f"{x:.8f}".rstrip("0").rstrip(".")
+
+
+def parse_usd(text):
+    t = text.strip()
+    m = re.fullmatch(r"\$?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:[.,]\d+)?)\s*(?:usd|dollars?|\$)?", t, re.I)
+    if not m: return None
+    n = m.group(1)
+    n = n.replace(",", "") if re.fullmatch(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?", n) else n.replace(",", ".")
+    return float(n)
+
+
+async def usd_to_coin(code, usd):
+    """How much of `code` is worth `usd` dollars: mid-point of FixedFloat quotes against USDT."""
+    if code.startswith(("USDT", "USDC", "DAI", "TUSD", "FDUSD", "PYUSD")): return fmt(usd)
+    ref = next((k for k in ("USDTTRC", "USDTETH", "USDTBSC", "USDTSOL")
+                if any(c["code"] == k and c.get("send") and c.get("recv") for c in ccies)), None)
+    if not ref: raise FFError("USD pricing is unavailable right now")
+    hi = await ff("price", fromCcy=code, toCcy=ref, amount=fmt(usd), direction="to", type="float")
+    lo = await ff("price", fromCcy=ref, toCcy=code, amount=fmt(usd), direction="from", type="float")
+    for q in (hi, lo):
+        if q.get("errors"): raise FFError(str(q["errors"]))
+    coin = (float(hi["from"]["amount"]) + float(lo["to"]["amount"])) / 2
+    if coin <= 0: raise FFError("couldn't price that amount")
+    return fmt(coin)
+
+
 class AmountModal(discord.ui.Modal):
     def __init__(self, w):
         super().__init__(title="How much?")
         self.w = w
-        self.amount = discord.ui.TextInput(label=f"Amount of {w.send} to send"[:45], max_length=24)
+        self.amount = discord.ui.TextInput(label="Amount in USD (e.g. 100)", max_length=16)
         self.add_item(self.amount)
 
     async def on_submit(self, i: discord.Interaction):
         w = self.w
-        try:
-            val = float(self.amount.value.replace(",", ".").strip())
-        except ValueError:
-            val = 0
-        amt = f"{val:.8f}".rstrip("0").rstrip(".")
-        if val <= 0 or not amt:
-            return await i.response.send_message("That isn't a valid amount. Press Enter amount and try again.", ephemeral=True)
-        w.amount = amt
+        usd = parse_usd(self.amount.value)
+        if usd is None or usd <= 0:
+            return await i.response.send_message("That isn't a valid USD amount. Press Enter amount and try again.", ephemeral=True)
         await i.response.defer()
-        try:
-            await w.refresh_quote()
-        except (FFError, KeyError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            return await w._go(i, "amount", f"Can't quote that amount: {e}", deferred=True)
-        await w._go(i, "address", deferred=True)
+        err = await w.set_usd(usd)
+        await w._go(i, "amount" if err else "address", err, deferred=True)
 
 
 class AddressModal(discord.ui.Modal):
@@ -245,10 +270,8 @@ class AddressModal(discord.ui.Modal):
         w.address = self.address.value.strip()
         w.memo = self.memo.value.strip() if self.memo else None
         await i.response.defer()
-        try:
-            await w.refresh_quote()  # re-quote so the confirmation shows a fresh estimate
-        except (FFError, KeyError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            return await w._go(i, "amount", f"Can't quote that swap: {e}", deferred=True)
+        err = await w.set_usd(w.usd)  # re-price so the confirmation is fresh
+        if err: return await w._go(i, "amount", err, deferred=True)
         await w._go(i, "confirm", deferred=True)
 
 
@@ -259,9 +282,9 @@ class Wizard(discord.ui.View):
               "confirm": "Confirm your swap"}
     PREV = {"recv": "send", "amount": "recv", "address": "amount", "confirm": "address"}
 
-    def __init__(self, user):
+    def __init__(self, user, channel_id=None):
         super().__init__(timeout=900)
-        self.user = user
+        self.user, self.channel_id, self.last_i, self.busy, self.usd = user, channel_id, None, False, None
         self.step, self.page, self.pages, self.query, self.notice = "send", 0, 1, "", None
         self.send = self.recv = self.amount = self.address = self.memo = self.est = None
         self.render()
@@ -309,7 +332,10 @@ class Wizard(discord.ui.View):
                          else f'Showing results for "{self.query}". Search with an empty box to see all coins.')
             e.set_footer(text=f"Page {self.page + 1}/{self.pages}")
         elif self.step == "amount":
-            lines.append(f"Press **Enter amount** and type how much {self.send} you want to send.")
+            lines.append("**Type the amount in USD in this chat** (for example `100`), or press Enter amount. "
+                         f"I'll work out how much {self.send} that is." if CHAT_INPUT else
+                         f"Press **Enter amount** and type how much you want to swap in USD. "
+                         f"I'll work out how much {self.send} that is.")
         elif self.step == "address":
             lines.append(f"Press **Enter address** and paste the **{coin_label(self.recv)}** address that should "
                          "receive your coins. Double-check it: swaps can't be reversed.")
@@ -317,8 +343,10 @@ class Wizard(discord.ui.View):
             e.set_footer(text=f"Rate: {RATE_TYPE}. The final amount can differ slightly on float rates. "
                               "By confirming you accept the terms.")
         e.description = "\n".join(lines) or None
-        if self.send: e.add_field(name="You send", value=coin_label(self.send) if not self.amount
-                                  else f"{self.amount} {self.send}")
+        if self.send:
+            val = coin_label(self.send) if not self.amount else f"{self.amount} {self.send}"
+            if self.amount and self.usd: val += f" (≈ ${self.usd:,.2f})"
+            e.add_field(name="You send", value=val)
         if self.recv: e.add_field(name="You receive", value=coin_label(self.recv) if not self.est
                                   else f"≈ {self.est} {self.recv}")
         if self.address and self.step in ("confirm",):
@@ -327,10 +355,41 @@ class Wizard(discord.ui.View):
         return e
 
     async def _go(self, i, step, notice=None, deferred=False):
-        self.step, self.notice = step, notice
+        self.step, self.notice, self.last_i = step, notice, i
+        if step == "amount": waiting[self.channel_id] = self
+        elif waiting.get(self.channel_id) is self: del waiting[self.channel_id]
         self.render()
         if deferred: await i.edit_original_response(embed=self.embed(), view=self)
         else: await i.response.edit_message(embed=self.embed(), view=self)
+
+    async def set_usd(self, usd):
+        """Convert USD to a coin amount and quote it. Returns an error string, or None on success."""
+        try:
+            self.usd = usd
+            self.amount = await usd_to_coin(self.send, usd)
+            await self.refresh_quote()
+        except (FFError, KeyError, ValueError, ZeroDivisionError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            self.amount = self.est = None
+            return f"Can't price ${usd:,.2f}: {e}"
+
+    async def on_amount_text(self, m: discord.Message):
+        usd = parse_usd(m.content)
+        if usd is None or usd <= 0 or self.busy: return
+        self.busy = True
+        try:
+            try: await m.delete()
+            except discord.HTTPException: pass
+            err = await self.set_usd(usd)
+            try:
+                await self._go(self.last_i, "amount" if err else "address", err, deferred=True)
+            except discord.HTTPException:
+                waiting.pop(self.channel_id, None)
+                await m.channel.send(f"{m.author.mention} this menu expired. Press **Start swap** again.")
+        finally:
+            self.busy = False
+
+    async def on_timeout(self):
+        if waiting.get(self.channel_id) is self: del waiting[self.channel_id]
 
     async def refresh_quote(self):
         q = await ff("price", fromCcy=self.send, toCcy=self.recv, amount=self.amount, direction="from", type=RATE_TYPE)
@@ -370,7 +429,8 @@ class Wizard(discord.ui.View):
             o = await ff("create", **params)
             ok = (o["from"]["code"] == self.send and o["to"]["code"] == self.recv
                   and o["to"]["address"].lower() == self.address.lower()
-                  and o["from"]["address"] and abs(float(o["from"]["amount"]) - float(self.amount)) < 1e-9)
+                  and o["from"]["address"]
+                  and abs(float(o["from"]["amount"]) - float(self.amount)) <= 0.001 * float(self.amount) + 1e-9)
         except (FFError, KeyError, ValueError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             return await self._go(i, "address", f"Order failed (nothing to pay): {e}. Check the address and try again.",
                                   deferred=True)
@@ -514,6 +574,16 @@ async def refresh():
     global ccies
     try: ccies = await ff("ccies")
     except Exception as e: print("ccies refresh failed", e)
+
+
+@bot.event
+async def on_message(m: discord.Message):
+    if m.author.bot or not m.guild: return
+    w = waiting.get(m.channel.id)
+    if not w: return
+    if w.is_finished(): waiting.pop(m.channel.id, None); return
+    if w.user.id == m.author.id and w.step == "amount":
+        await w.on_amount_text(m)
 
 
 @bot.event
