@@ -209,6 +209,9 @@ class SearchModal(discord.ui.Modal):
         await w._go(i, w.step)
 
 
+def money(x): return f"${x:,.2f}"
+
+
 def fmt(x): return f"{x:.8f}".rstrip("0").rstrip(".")
 
 
@@ -286,7 +289,7 @@ class Wizard(discord.ui.View):
         super().__init__(timeout=900)
         self.user, self.channel_id, self.last_i, self.busy, self.usd = user, channel_id, None, False, None
         self.step, self.page, self.pages, self.query, self.notice = "send", 0, 1, "", None
-        self.send = self.recv = self.amount = self.address = self.memo = self.est = None
+        self.send = self.recv = self.amount = self.address = self.memo = self.est = self.limits = None
         self.render()
 
     async def interaction_check(self, i):
@@ -349,6 +352,12 @@ class Wizard(discord.ui.View):
             e.add_field(name="You send", value=val)
         if self.recv: e.add_field(name="You receive", value=coin_label(self.recv) if not self.est
                                   else f"≈ {self.est} {self.recv}")
+        if self.step == "amount" and self.limits:
+            mn, mx, mnc, mxc = self.limits
+            parts = []
+            if mn is not None: parts.append(f"**Minimum:** {money(mn)} ({mnc} {self.send})")
+            if mx is not None: parts.append(f"**Maximum:** {money(mx)} ({mxc} {self.send})")
+            if parts: e.add_field(name="Limits for this swap", value="\n".join(parts), inline=False)
         if self.address and self.step in ("confirm",):
             e.add_field(name="To address", value=f"```{self.address}```", inline=False)
             if self.memo: e.add_field(name="Memo / tag", value=f"```{self.memo}```", inline=False)
@@ -362,10 +371,32 @@ class Wizard(discord.ui.View):
         if deferred: await i.edit_original_response(embed=self.embed(), view=self)
         else: await i.response.edit_message(embed=self.embed(), view=self)
 
+    async def load_limits(self):
+        """Probe a ~$100 quote for this pair and read FixedFloat's min/max (converted to USD)."""
+        self.limits = None
+        try:
+            probe = float(await usd_to_coin(self.send, 100))
+            q = await ff("price", fromCcy=self.send, toCcy=self.recv, amount=fmt(probe),
+                         direction="from", type=RATE_TYPE)
+            f, per = q["from"], 100 / probe  # per = USD value of one coin
+            mn, mx = f.get("min"), f.get("max")
+            mn_usd = float(mn) * per if mn not in (None, "") else None
+            mx_usd = float(mx) * per if mx not in (None, "") else None
+            if mn_usd is not None or mx_usd is not None:
+                self.limits = (mn_usd, mx_usd, fmt(float(mn)) if mn_usd is not None else None,
+                               fmt(float(mx)) if mx_usd is not None else None)
+        except (FFError, KeyError, ValueError, ZeroDivisionError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print("limits unavailable", self.send, self.recv, e)
+
     async def set_usd(self, usd):
         """Convert USD to a coin amount and quote it. Returns an error string, or None on success."""
         try:
             self.usd = usd
+            if self.limits:
+                if self.limits[0] and usd < self.limits[0] * 0.98:
+                    raise FFError(f"below the minimum of {money(self.limits[0])}")
+                if self.limits[1] and usd > self.limits[1] * 1.02:
+                    raise FFError(f"above the maximum of {money(self.limits[1])}")
             self.amount = await usd_to_coin(self.send, usd)
             await self.refresh_quote()
         except (FFError, KeyError, ValueError, ZeroDivisionError, aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -400,7 +431,11 @@ class Wizard(discord.ui.View):
         async def cb(i):
             self.query, self.page = "", 0
             if self.step == "send": self.send = code; await self._go(i, "recv")
-            else: self.recv = code; await self._go(i, "amount")
+            else:
+                self.recv = code
+                await i.response.defer()
+                await self.load_limits()
+                await self._go(i, "amount", deferred=True)
         return cb
 
     async def prev(self, i): self.page -= 1; await self._go(i, self.step)
@@ -414,8 +449,9 @@ class Wizard(discord.ui.View):
         await self._go(i, self.PREV[self.step])
 
     async def cancel(self, i):
-        self.stop()
-        await i.response.edit_message(content="Cancelled.", embed=None, view=None)
+        self.send = self.recv = self.amount = self.address = self.memo = self.est = self.usd = self.limits = None
+        self.query, self.page = "", 0
+        await self._go(i, "send")
 
     async def confirm(self, i: discord.Interaction):
         if latest_order(i.channel_id):
