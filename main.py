@@ -160,46 +160,26 @@ async def setup(inter: discord.Interaction, category: discord.CategoryChannel | 
 
 
 # ---------- swap ----------
-class ConfirmView(discord.ui.View):
-    def __init__(self, user, run):
-        super().__init__(timeout=120)
-        self.user, self.run, self.used = user, run, False
-
-    async def interaction_check(self, i): return i.user.id == self.user.id
-
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
-    async def ok(self, i: discord.Interaction, b):
-        if self.used: return
-        self.used = True; self.stop()
-        await i.response.edit_message(content="Creating your order...", embed=None, view=None)
-        await self.run(i)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
-    async def no(self, i: discord.Interaction, b):
-        self.used = True; self.stop()
-        await i.response.edit_message(content="Cancelled.", embed=None, view=None)
-
-
 POPULAR = ["BTC", "ETH", "LTC", "XMR", "SOL", "USDTTRC", "USDTETH", "USDTBSC", "USDTSOL", "USDCETH",
            "BNB", "XRP", "DOGE", "TRX", "TON", "ADA", "BCH", "DASH", "ZEC", "AVAX", "DOT", "XLM", "ETC",
            "BTCLN", "MATIC"]
 
 
-def popular(field):
+def ordered(field):
     ok = [c for c in ccies if c.get(field)]
     by = {c["code"]: c for c in ok}
-    return ([by[k] for k in POPULAR if k in by] + [c for c in ok if c["code"] not in POPULAR])[:25]
+    return [by[k] for k in POPULAR if k in by] + [c for c in ok if c["code"] not in POPULAR]
 
 
 def search(field, q):
     q = q.lower().strip()
-    return [c for c in ccies if c.get(field) and (q in c["code"].lower() or q in c["name"].lower()
-                                                   or q in c["network"].lower())][:25]
+    return [c for c in ordered(field) if q in c["code"].lower() or q in c["name"].lower()
+            or q in c["network"].lower()]
 
 
-def opts(pool):
-    return [discord.SelectOption(label=f'{c["name"]} ({c["network"]})'[:100], value=c["code"],
-                                 description=c["code"]) for c in pool[:25]]
+def btn_label(c):
+    coin = c.get("coin") or c["code"]
+    return (coin if c["network"] in (coin, c["code"]) else f'{coin} ({c["network"]})')[:80]
 
 
 def coin_label(code):
@@ -208,121 +188,203 @@ def coin_label(code):
 
 
 class SearchModal(discord.ui.Modal):
-    def __init__(self, w, field):
+    def __init__(self, w):
         super().__init__(title="Search coins")
-        self.w, self.field = w, field
-        self.q = discord.ui.TextInput(label="Coin name, ticker or network", required=False, max_length=40)
+        self.w = w
+        self.q = discord.ui.TextInput(label="Coin name, ticker or network (empty = all)", required=False, max_length=40)
         self.add_item(self.q)
 
     async def on_submit(self, i: discord.Interaction):
-        text = self.q.value.strip()
-        hits = search(self.field, text) if text else popular(self.field)
-        if not hits:
+        w, text = self.w, self.q.value.strip()
+        field = "send" if w.step == "send" else "recv"
+        if text and not search(field, text):
             return await i.response.send_message("No coins found. Try another name.", ephemeral=True)
-        (self.w.s_sel if self.field == "send" else self.w.r_sel).options = opts(hits)
-        await i.response.edit_message(embed=self.w.embed(), view=self.w)
+        w.query, w.page = text, 0
+        await w._go(i, w.step)
 
 
-class DetailsModal(discord.ui.Modal):
-    def __init__(self, send, recv):
-        super().__init__(title="Swap details")
-        self.send, self.recv = send, recv
-        dst = next(c for c in ccies if c["code"] == recv)
-        self.amount = discord.ui.TextInput(label=f"Amount of {send} to send"[:45], max_length=24)
-        self.address = discord.ui.TextInput(label=f"Your {recv} receiving address"[:45], max_length=200)
-        self.add_item(self.amount); self.add_item(self.address)
+class AmountModal(discord.ui.Modal):
+    def __init__(self, w):
+        super().__init__(title="How much?")
+        self.w = w
+        self.amount = discord.ui.TextInput(label=f"Amount of {w.send} to send"[:45], max_length=24)
+        self.add_item(self.amount)
+
+    async def on_submit(self, i: discord.Interaction):
+        w = self.w
+        try:
+            val = float(self.amount.value.replace(",", ".").strip())
+        except ValueError:
+            val = 0
+        amt = f"{val:.8f}".rstrip("0").rstrip(".")
+        if val <= 0 or not amt:
+            return await i.response.send_message("That isn't a valid amount. Press Enter amount and try again.", ephemeral=True)
+        w.amount = amt
+        await i.response.defer()
+        try:
+            await w.refresh_quote()
+        except (FFError, KeyError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            return await w._go(i, "amount", f"Can't quote that amount: {e}", deferred=True)
+        await w._go(i, "address", deferred=True)
+
+
+class AddressModal(discord.ui.Modal):
+    def __init__(self, w):
+        super().__init__(title="Receiving address")
+        self.w = w
+        self.address = discord.ui.TextInput(label=f"Your {w.recv} address"[:45], max_length=200)
+        self.add_item(self.address)
         self.memo = None
-        if dst.get("tag"):
-            self.memo = discord.ui.TextInput(label=f'{dst["tag"]} (required)'[:45], max_length=100)
+        tag = (w.dst() or {}).get("tag")
+        if tag:
+            self.memo = discord.ui.TextInput(label=f"{tag} (required)"[:45], max_length=100)
             self.add_item(self.memo)
 
     async def on_submit(self, i: discord.Interaction):
+        w = self.w
+        w.address = self.address.value.strip()
+        w.memo = self.memo.value.strip() if self.memo else None
+        await i.response.defer()
         try:
-            amount = float(self.amount.value.replace(",", ".").strip())
-        except ValueError:
-            return await i.response.send_message("That amount isn't a number. Press Start swap and try again.", ephemeral=True)
-        if amount <= 0:
-            return await i.response.send_message("Amount must be above 0.", ephemeral=True)
-        memo = self.memo.value.strip() if self.memo else None
-        await start_quote(i, self.send, self.recv, amount, self.address.value.strip(), memo)
+            await w.refresh_quote()  # re-quote so the confirmation shows a fresh estimate
+        except (FFError, KeyError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            return await w._go(i, "amount", f"Can't quote that swap: {e}", deferred=True)
+        await w._go(i, "confirm", deferred=True)
 
 
 class Wizard(discord.ui.View):
+    """One ephemeral message that walks through: send coin -> receive coin -> amount -> address -> confirm."""
+    TITLES = {"send": "Step 1/4 · Choose the coin you SEND", "recv": "Step 2/4 · Choose the coin you RECEIVE",
+              "amount": "Step 3/4 · How much do you want to send?", "address": "Step 4/4 · Where should we send it?",
+              "confirm": "Confirm your swap"}
+    PREV = {"recv": "send", "amount": "recv", "address": "amount", "confirm": "address"}
+
     def __init__(self, user):
         super().__init__(timeout=900)
-        self.user, self.send, self.recv = user, None, None
-        self.s_sel = discord.ui.Select(placeholder="1. Coin you SEND", options=opts(popular("send")), row=0)
-        self.r_sel = discord.ui.Select(placeholder="2. Coin you RECEIVE", options=opts(popular("recv")), row=1)
-        self.s_sel.callback, self.r_sel.callback = self.on_send, self.on_recv
-        self.add_item(self.s_sel); self.add_item(self.r_sel)
-        self.go.disabled = True
+        self.user = user
+        self.step, self.page, self.pages, self.query, self.notice = "send", 0, 1, "", None
+        self.send = self.recv = self.amount = self.address = self.memo = self.est = None
+        self.render()
 
     async def interaction_check(self, i): return i.user.id == self.user.id
 
+    def dst(self): return next((c for c in ccies if c["code"] == self.recv), None)
+
+    def _btn(self, label, cb, style=discord.ButtonStyle.secondary, row=None, disabled=False):
+        b = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
+        b.callback = cb
+        self.add_item(b)
+
+    def render(self):
+        self.clear_items()
+        if self.step in ("send", "recv"):
+            field = "send" if self.step == "send" else "recv"
+            pool = search(field, self.query) if self.query else ordered(field)
+            if self.step == "recv": pool = [c for c in pool if c["code"] != self.send]
+            self.pages = max(1, -(-len(pool) // 20))
+            self.page = max(0, min(self.page, self.pages - 1))
+            for n, c in enumerate(pool[self.page * 20:(self.page + 1) * 20]):
+                self._btn(btn_label(c), self._pick(c["code"]), row=n // 5)
+            self._btn("◀", self.prev, row=4, disabled=self.page == 0)
+            self._btn("▶", self.next, row=4, disabled=self.page >= self.pages - 1)
+            self._btn("🔍 Search", self.open_search, row=4)
+            if self.step == "recv": self._btn("Back", self.back, row=4)
+            self._btn("Cancel", self.cancel, discord.ButtonStyle.danger, row=4)
+            return
+        main = {"amount": ("Enter amount", self.ask_amount), "address": ("Enter address", self.ask_address),
+                "confirm": ("Confirm swap", self.confirm)}[self.step]
+        self._btn(main[0], main[1], discord.ButtonStyle.success)
+        self._btn("Back", self.back)
+        self._btn("Cancel", self.cancel, discord.ButtonStyle.danger)
+
     def embed(self):
-        e = discord.Embed(title="New swap", color=0x5865F2,
-                          description="Pick both coins (use the search buttons for others), then continue.")
-        e.add_field(name="You send", value=coin_label(self.send))
-        e.add_field(name="You receive", value=coin_label(self.recv))
+        e = discord.Embed(title=self.TITLES[self.step], color=0x5865F2)
+        lines = []
+        if self.notice: lines.append(f"⚠️ {self.notice}")
+        if self.step in ("send", "recv"):
+            lines.append("Press a coin below, or use Search for others." if not self.query
+                         else f'Showing results for "{self.query}". Search with an empty box to see all coins.')
+            e.set_footer(text=f"Page {self.page + 1}/{self.pages}")
+        elif self.step == "amount":
+            lines.append(f"Press **Enter amount** and type how much {self.send} you want to send.")
+        elif self.step == "address":
+            lines.append(f"Press **Enter address** and paste the **{coin_label(self.recv)}** address that should "
+                         "receive your coins. Double-check it: swaps can't be reversed.")
+        else:
+            e.set_footer(text=f"Rate: {RATE_TYPE}. The final amount can differ slightly on float rates. "
+                              "By confirming you accept the terms.")
+        e.description = "\n".join(lines) or None
+        if self.send: e.add_field(name="You send", value=coin_label(self.send) if not self.amount
+                                  else f"{self.amount} {self.send}")
+        if self.recv: e.add_field(name="You receive", value=coin_label(self.recv) if not self.est
+                                  else f"≈ {self.est} {self.recv}")
+        if self.address and self.step in ("confirm",):
+            e.add_field(name="To address", value=f"```{self.address}```", inline=False)
+            if self.memo: e.add_field(name="Memo / tag", value=f"```{self.memo}```", inline=False)
         return e
 
-    async def _update(self, i):
-        self.go.disabled = not (self.send and self.recv and self.send != self.recv)
-        await i.response.edit_message(embed=self.embed(), view=self)
+    async def _go(self, i, step, notice=None, deferred=False):
+        self.step, self.notice = step, notice
+        self.render()
+        if deferred: await i.edit_original_response(embed=self.embed(), view=self)
+        else: await i.response.edit_message(embed=self.embed(), view=self)
 
-    async def on_send(self, i): self.send = self.s_sel.values[0]; await self._update(i)
-    async def on_recv(self, i): self.recv = self.r_sel.values[0]; await self._update(i)
+    async def refresh_quote(self):
+        q = await ff("price", fromCcy=self.send, toCcy=self.recv, amount=self.amount, direction="from", type=RATE_TYPE)
+        if q.get("errors"): raise FFError(str(q["errors"]))
+        self.est = q["to"]["amount"]
 
-    @discord.ui.button(label="Search send coin", style=discord.ButtonStyle.grey, row=2)
-    async def srch_s(self, i: discord.Interaction, b): await i.response.send_modal(SearchModal(self, "send"))
+    def _pick(self, code):
+        async def cb(i):
+            self.query, self.page = "", 0
+            if self.step == "send": self.send = code; await self._go(i, "recv")
+            else: self.recv = code; await self._go(i, "amount")
+        return cb
 
-    @discord.ui.button(label="Search receive coin", style=discord.ButtonStyle.grey, row=2)
-    async def srch_r(self, i: discord.Interaction, b): await i.response.send_modal(SearchModal(self, "recv"))
+    async def prev(self, i): self.page -= 1; await self._go(i, self.step)
+    async def next(self, i): self.page += 1; await self._go(i, self.step)
+    async def open_search(self, i): await i.response.send_modal(SearchModal(self))
+    async def ask_amount(self, i): await i.response.send_modal(AmountModal(self))
+    async def ask_address(self, i): await i.response.send_modal(AddressModal(self))
 
-    @discord.ui.button(label="Continue", style=discord.ButtonStyle.green, row=2)
-    async def go(self, i: discord.Interaction, b):
-        await i.response.send_modal(DetailsModal(self.send, self.recv))
+    async def back(self, i):
+        self.query, self.page = "", 0
+        await self._go(i, self.PREV[self.step])
 
+    async def cancel(self, i):
+        self.stop()
+        await i.response.edit_message(content="Cancelled.", embed=None, view=None)
 
-async def start_quote(inter: discord.Interaction, send, receive, amount, address, memo):
-    uid = inter.user.id
-    await inter.response.defer(ephemeral=True)
-    amt = f"{amount:.8f}".rstrip("0").rstrip(".")
-    try:
-        q = await ff("price", fromCcy=send, toCcy=receive, amount=amt, direction="from", type=RATE_TYPE)
-    except FFError as e:
-        return await inter.followup.send(f"Can't quote that swap: {e}", ephemeral=True)
-    if q.get("errors"):
-        return await inter.followup.send(f"Can't quote that swap: {q['errors']}", ephemeral=True)
-
-    async def create(i: discord.Interaction):
+    async def confirm(self, i: discord.Interaction):
         if latest_order(i.channel_id):
-            return await i.followup.send("This ticket already has a swap.", ephemeral=True)
+            self.stop()
+            return await i.response.edit_message(content="This ticket already has a swap.", embed=None, view=None)
+        await i.response.edit_message(embed=discord.Embed(title="Creating your order...", color=0x5865F2), view=None)
         try:
-            params = dict(fromCcy=send, toCcy=receive, toAddress=address, amount=amt,
+            params = dict(fromCcy=self.send, toCcy=self.recv, toAddress=self.address, amount=self.amount,
                           direction="from", type=RATE_TYPE)
-            if memo: params["tag"] = memo
+            if self.memo: params["tag"] = self.memo
             o = await ff("create", **params)
-            ok = (o["from"]["code"] == send and o["to"]["code"] == receive
-                  and o["to"]["address"].lower() == address.lower()
-                  and o["from"]["address"] and abs(float(o["from"]["amount"]) - float(amt)) < 1e-9)
+            ok = (o["from"]["code"] == self.send and o["to"]["code"] == self.recv
+                  and o["to"]["address"].lower() == self.address.lower()
+                  and o["from"]["address"] and abs(float(o["from"]["amount"]) - float(self.amount)) < 1e-9)
         except (FFError, KeyError, ValueError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            return await i.followup.send(f"Order failed, nothing to pay: {e}", ephemeral=True)
-        db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,NULL)",
-                   (o["id"], o["token"], uid, i.channel_id, o["status"], time.time())); db.commit()
+            return await self._go(i, "address", f"Order failed (nothing to pay): {e}. Check the address and try again.",
+                                  deferred=True)
+        self.stop()
         if not ok:
-            print("MISMATCH", o["id"])
-            return await i.followup.send("Order details didn't match your request, so I won't show a deposit "
-                                         "address. Do NOT send funds. Try again in a new ticket.", ephemeral=True)
-        await i.channel.send(i.user.mention, embed=invoice_embed(o), view=EmergencyView())
-        await i.followup.send("Invoice posted in this ticket.", ephemeral=True)
-
-    e = discord.Embed(title="Confirm swap", color=0x5865F2)
-    e.add_field(name="You send", value=f"{amt} {send}")
-    e.add_field(name="You receive (est.)", value=f'{q["to"]["amount"]} {receive}')
-    e.add_field(name="To", value=f"`{address}`", inline=False)
-    e.set_footer(text=f"Rate: {RATE_TYPE}. The final amount can differ slightly on float rates.")
-    await inter.followup.send(embed=e, view=ConfirmView(inter.user, create), ephemeral=True)
+            print("MISMATCH", o.get("id"))
+            return await i.edit_original_response(view=None, embed=discord.Embed(
+                title="Order didn't match your request", color=0xED4245,
+                description="For safety I won't show a deposit address. Do NOT send funds. Press Start swap to try again."))
+        db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,NULL)",
+                   (o["id"], o["token"], i.user.id, i.channel_id, o["status"], time.time())); db.commit()
+        try:
+            await i.channel.send(i.user.mention, embed=invoice_embed(o), view=EmergencyView())
+            await i.edit_original_response(view=None, embed=discord.Embed(
+                title="Invoice posted in this ticket ✅", color=0x57F287))
+        except discord.HTTPException:
+            await i.edit_original_response(embed=invoice_embed(o), view=None)
 
 
 def invoice_embed(o):
