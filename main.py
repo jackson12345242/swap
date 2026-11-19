@@ -15,6 +15,7 @@ DB_PATH = os.getenv("DB_PATH", "/data/swaps.db")
 MAX_AGE = 3 * 86400      # stop polling orders older than this
 CLOSE_DELAY = 600        # seconds before a finished ticket channel is deleted
 FINAL = ("DONE", "EXPIRED")
+BLURPLE, GREEN, GOLD, RED = 0x5865F2, 0x57F287, 0xFEE75C, 0xED4245
 CHAT_INPUT = os.getenv("CHAT_INPUT", "1") == "1"  # type the USD amount in chat (needs Message Content Intent)
 TOS_TEXT = (
     "**By using this service you agree to the terms:** swaps are executed by a third party "
@@ -34,6 +35,8 @@ CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY, token TEXT, user_id INT, 
     status TEXT, created REAL, close_at REAL);
 CREATE TABLE IF NOT EXISTS tickets(channel_id INT PRIMARY KEY, user_id INT, guild_id INT, created REAL);
 CREATE TABLE IF NOT EXISTS config(guild_id INT PRIMARY KEY, category_id INT, staff_role_id INT);
+CREATE TABLE IF NOT EXISTS addresses(user_id INT, code TEXT, address TEXT, memo TEXT, updated REAL,
+    PRIMARY KEY(user_id, code));
 """)
 db.commit()
 
@@ -63,6 +66,11 @@ async def ff(method, **params):
 def latest_order(channel_id):
     return db.execute("SELECT id, token, user_id, status FROM orders WHERE channel_id=? "
                       "ORDER BY created DESC LIMIT 1", (channel_id,)).fetchone()
+
+
+def get_saved(uid, code):
+    r = db.execute("SELECT address, memo FROM addresses WHERE user_id=? AND code=?", (uid, code)).fetchone()
+    return {"address": r[0], "memo": r[1]} if r else None
 
 
 # ---------- panel + tickets ----------
@@ -98,11 +106,14 @@ class PanelView(discord.ui.View):
             except discord.HTTPException as e:
                 return await i.followup.send(f"Couldn't create your ticket: {e}", ephemeral=True)
             db.execute("INSERT INTO tickets VALUES(?,?,?,?)", (ch.id, uid, g.id, time.time())); db.commit()
-            e = discord.Embed(title="Your swap ticket", color=0x5865F2, description=(
-                "Press **Start swap** below, pick the coin you send and the coin you receive from the menus, "
-                "then enter the amount and your receiving address.\n\n"
-                "I'll post your invoice and every status update, with transaction IDs, in this channel.\n\n"
-                + TOS_TEXT))
+            e = discord.Embed(title="🎫 Your swap ticket", color=BLURPLE, description=(
+                "Welcome! Here's how this works:\n\n"
+                "**1️⃣** Press **Start swap** below\n"
+                "**2️⃣** Pick the coin you send and the coin you receive\n"
+                "**3️⃣** Type the amount in USD, then your receiving address\n"
+                "**4️⃣** Confirm, send the deposit and watch the status update live here"))
+            e.add_field(name="📜 Terms", value=TOS_TEXT, inline=False)
+            e.set_footer(text="Private ticket · only you and staff can see this channel")
             await ch.send(i.user.mention, embed=e, view=TicketView())
             await i.followup.send(f"Your ticket: {ch.mention}", ephemeral=True)
         finally:
@@ -153,9 +164,14 @@ async def setup(inter: discord.Interaction, category: discord.CategoryChannel | 
             category = await g.create_category("Swap Tickets", overwrites={
                 g.default_role: discord.PermissionOverwrite(view_channel=False),
                 g.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)})
-        e = discord.Embed(title="Crypto Swaps", color=0x57F287, description=(
-            "Swap between hundreds of coins at the best available rate. Press the button to open a "
-            "private ticket.\n\n" + TOS_TEXT))
+        e = discord.Embed(title="💱 Crypto Swaps", color=BLURPLE, description=(
+            "Swap between hundreds of coins at the best available rate. Fast, private and non-custodial."))
+        e.add_field(name="How it works", value=("1️⃣ Press **Start a swap**\n2️⃣ Pick your coins and type an amount in USD\n"
+                                                "3️⃣ Send the deposit and track it live"), inline=False)
+        e.add_field(name="Why use it", value="⚡ Hundreds of coins\n🔒 We never hold your funds\n🎫 A private ticket for every swap",
+                    inline=False)
+        e.add_field(name="📜 Terms", value=TOS_TEXT, inline=False)
+        e.set_footer(text="Powered by FixedFloat")
         await inter.channel.send(embed=e, view=PanelView())
     except discord.HTTPException as ex:
         return await inter.followup.send(f"Setup failed (check my permissions: Manage Channels, "
@@ -262,28 +278,35 @@ class AddressModal(discord.ui.Modal):
         self.w = w
         self.address = discord.ui.TextInput(label=f"Your {w.recv} address"[:45], max_length=200)
         self.add_item(self.address)
-        self.memo = None
-        tag = (w.dst() or {}).get("tag")
-        if tag:
-            self.memo = discord.ui.TextInput(label=f"{tag} (required)"[:45], max_length=100)
-            self.add_item(self.memo)
 
     async def on_submit(self, i: discord.Interaction):
         w = self.w
-        w.address = self.address.value.strip()
-        w.memo = self.memo.value.strip() if self.memo else None
+        w.address, w.memo = self.address.value.strip(), None
         await i.response.defer()
-        err = await w.set_usd(w.usd)  # re-price so the confirmation is fresh
-        if err: return await w._go(i, "amount", err, deferred=True)
-        await w._go(i, "confirm", deferred=True)
+        await w.to_confirm(i)
+
+
+class MemoModal(discord.ui.Modal):
+    def __init__(self, w):
+        super().__init__(title="Memo / tag")
+        self.w = w
+        tag = (w.dst() or {}).get("tag") or "memo"
+        self.memo = discord.ui.TextInput(label=f"{tag}"[:45], max_length=100)
+        self.add_item(self.memo)
+
+    async def on_submit(self, i: discord.Interaction):
+        self.w.memo = self.memo.value.strip()
+        await i.response.defer()
+        await self.w.to_confirm(i)
 
 
 class Wizard(discord.ui.View):
     """One message in the ticket that walks through: send coin -> receive coin -> amount -> address -> confirm."""
-    TITLES = {"send": "Step 1/4 · Choose the coin you SEND", "recv": "Step 2/4 · Choose the coin you RECEIVE",
-              "amount": "Step 3/4 · How much do you want to send?", "address": "Step 4/4 · Where should we send it?",
-              "confirm": "Confirm your swap"}
-    PREV = {"recv": "send", "amount": "recv", "address": "amount", "confirm": "address"}
+    TITLES = {"send": "Choose the coin you send", "recv": "Choose the coin you receive",
+              "amount": "How much do you want to swap?", "address": "Where should we send it?",
+              "memo": "One more detail: memo / tag", "confirm": "Review your swap"}
+    STEPNO = {"send": 1, "recv": 2, "amount": 3, "address": 4, "memo": 4, "confirm": 4}
+    PREV = {"recv": "send", "amount": "recv", "address": "amount", "memo": "address", "confirm": "address"}
 
     def __init__(self, user, channel_id=None):
         super().__init__(timeout=900)
@@ -306,6 +329,7 @@ class Wizard(discord.ui.View):
 
     def render(self):
         self.clear_items()
+        self.saved = get_saved(self.user.id, self.recv) if self.step == "address" and self.recv else None
         if self.step in ("send", "recv"):
             field = "send" if self.step == "send" else "recv"
             pool = search(field, self.query) if self.query else ordered(field)
@@ -320,52 +344,70 @@ class Wizard(discord.ui.View):
             if self.step == "recv": self._btn("Back", self.back, row=4)
             self._btn("Cancel", self.cancel, discord.ButtonStyle.danger, row=4)
             return
+        if self.step == "address" and self.saved:
+            self._btn("✅ Use saved address", self.use_saved, discord.ButtonStyle.success)
+            self._btn("Enter new address", self.ask_address)
+            self._btn("Back", self.back)
+            self._btn("Cancel", self.cancel, discord.ButtonStyle.danger)
+            self._btn("🗑 Forget saved", self.forget)
+            return
         main = {"amount": ("Enter amount", self.ask_amount), "address": ("Enter address", self.ask_address),
-                "confirm": ("Confirm swap", self.confirm)}[self.step]
+                "memo": ("Enter memo", self.ask_memo), "confirm": ("Confirm swap", self.confirm)}[self.step]
         self._btn(main[0], main[1], discord.ButtonStyle.success)
         self._btn("Back", self.back)
         self._btn("Cancel", self.cancel, discord.ButtonStyle.danger)
 
     def embed(self):
-        e = discord.Embed(title=self.TITLES[self.step], color=0x5865F2)
+        n = self.STEPNO[self.step]
+        e = discord.Embed(title=self.TITLES[self.step], color=GREEN if self.step == "confirm" else BLURPLE)
+        e.set_author(name=f"Crypto Swaps  ·  Step {n} of 4   {'▰' * n}{'▱' * (4 - n)}")
+        e.set_footer(text="Cancel starts over")
         lines = []
-        if self.notice: lines.append(f"⚠️ {self.notice}")
+        if self.notice: lines.append(f"⚠️ **{self.notice}**")
         if self.step in ("send", "recv"):
-            lines.append("Press a coin below, or use Search for others." if not self.query
-                         else f'Showing results for "{self.query}". Search with an empty box to see all coins.')
-            e.set_footer(text=f"Page {self.page + 1}/{self.pages}")
+            lines.append("Tap a coin below, or use **🔍 Search** to find any other coin." if not self.query
+                         else f'Results for **"{self.query}"**. Search with an empty box to see all coins.')
+            e.set_footer(text=f"Page {self.page + 1} of {self.pages}  ·  Cancel starts over")
         elif self.step == "amount":
-            lines.append("**Type the amount in USD in this chat** (for example `100`), or press Enter amount. "
-                         f"I'll work out how much {self.send} that is." if CHAT_INPUT else
-                         f"Press **Enter amount** and type how much you want to swap in USD. "
-                         f"I'll work out how much {self.send} that is.")
+            lines.append(("💬 **Type the amount in USD in this chat** (for example `100`), or press **Enter amount**."
+                          if CHAT_INPUT else "Press **Enter amount** and type how much you want to swap in USD.")
+                         + f"\nI'll work out how much {self.send} that is.")
         elif self.step == "address":
-            lines.append(f"Press **Enter address** and paste the **{coin_label(self.recv)}** address that should "
-                         "receive your coins. Double-check it: swaps can't be reversed.")
+            what = f"your **{coin_label(self.recv)}** address"
+            lines.append((f"💬 **Type {what} in this chat**, or press **Enter " + ("new " if self.saved else "") + "address**."
+                          if CHAT_INPUT else f"Press **Enter address** and paste {what}.")
+                         + "\nDouble-check it: swaps can't be reversed.")
+        elif self.step == "memo":
+            tag = (self.dst() or {}).get("tag") or "memo"
+            lines.append(f"{coin_label(self.recv)} needs a **{tag}**. Press **Enter memo** and paste it exactly: "
+                         "a wrong or missing one can lose funds.")
         else:
-            e.set_footer(text=f"Rate: {RATE_TYPE}. The final amount can differ slightly on float rates. "
-                              "By confirming you accept the terms.")
-        e.description = "\n".join(lines) or None
+            lines.append("Check everything below, then press **Confirm swap**.")
+            e.set_footer(text=f"Rate: {RATE_TYPE} (the final amount can differ slightly)  ·  By confirming you accept the terms")
+        e.description = "\n\n".join(lines) or None
         if self.send:
-            val = coin_label(self.send) if not self.amount else f"{self.amount} {self.send}"
-            if self.amount and self.usd: val += f" (≈ ${self.usd:,.2f})"
-            e.add_field(name="You send", value=val)
-        if self.recv: e.add_field(name="You receive", value=coin_label(self.recv) if not self.est
-                                  else f"≈ {self.est} {self.recv}")
+            val = f"**{self.amount}** {self.send}" if self.amount else coin_label(self.send)
+            if self.amount and self.usd: val += f"\n≈ {money(self.usd)}"
+            e.add_field(name="📤 You send", value=val)
+        if self.recv:
+            e.add_field(name="📥 You receive", value=f"≈ **{self.est}** {self.recv}" if self.est else coin_label(self.recv))
         if self.step == "amount" and self.limits:
             mn, mx, mnc, mxc = self.limits
             parts = []
-            if mn is not None: parts.append(f"**Minimum:** {money(mn)} ({mnc} {self.send})")
-            if mx is not None: parts.append(f"**Maximum:** {money(mx)} ({mxc} {self.send})")
-            if parts: e.add_field(name="Limits for this swap", value="\n".join(parts), inline=False)
-        if self.address and self.step in ("confirm",):
-            e.add_field(name="To address", value=f"```{self.address}```", inline=False)
-            if self.memo: e.add_field(name="Memo / tag", value=f"```{self.memo}```", inline=False)
+            if mn is not None: parts.append(f"▫️ **Minimum** {money(mn)} ({mnc} {self.send})")
+            if mx is not None: parts.append(f"▫️ **Maximum** {money(mx)} ({mxc} {self.send})")
+            if parts: e.add_field(name="📏 Limits for this swap", value="\n".join(parts), inline=False)
+        if self.step == "address" and self.saved:
+            e.add_field(name="💾 Saved address", value=f"```{self.saved['address']}```"
+                        + (f"\nMemo: `{self.saved['memo']}`" if self.saved["memo"] else ""), inline=False)
+        if self.step == "confirm":
+            e.add_field(name="📮 Payout address", value=f"```{self.address}```", inline=False)
+            if self.memo: e.add_field(name="🏷️ Memo / tag", value=f"```{self.memo}```", inline=False)
         return e
 
     async def _go(self, i, step, notice=None, deferred=False):
         self.step, self.notice, self.last_i = step, notice, i
-        if step == "amount": waiting[self.channel_id] = self
+        if step in ("amount", "address"): waiting[self.channel_id] = self
         elif waiting.get(self.channel_id) is self: del waiting[self.channel_id]
         self.render()
         if deferred: await i.edit_original_response(embed=self.embed(), view=self)
@@ -403,16 +445,45 @@ class Wizard(discord.ui.View):
             self.amount = self.est = None
             return f"Can't price ${usd:,.2f}: {e}"
 
-    async def on_amount_text(self, m: discord.Message):
-        usd = parse_usd(m.content)
-        if usd is None or usd <= 0 or self.busy: return
+    def needs_memo(self): return bool((self.dst() or {}).get("tag"))
+
+    async def to_confirm(self, i):
+        """Ask for a memo if the coin needs one, otherwise re-price and show the confirmation."""
+        if self.needs_memo() and not self.memo:
+            return await self._go(i, "memo", deferred=True)
+        err = await self.set_usd(self.usd)
+        await self._go(i, "amount" if err else "confirm", err, deferred=True)
+
+    async def use_saved(self, i):
+        if not self.saved:
+            return await i.response.send_message("No saved address for this coin.", ephemeral=True)
+        self.address, self.memo = self.saved["address"], self.saved["memo"]
+        await i.response.defer()
+        await self.to_confirm(i)
+
+    async def forget(self, i):
+        db.execute("DELETE FROM addresses WHERE user_id=? AND code=?", (self.user.id, self.recv)); db.commit()
+        await self._go(i, "address", "Saved address deleted.")
+
+    async def on_text(self, m: discord.Message):
+        txt = m.content.strip()
+        if not txt or self.busy: return
+        if self.step == "amount":
+            usd = parse_usd(txt)
+            if usd is None or usd <= 0: return
+        elif not (10 <= len(txt) <= 200 and not any(c.isspace() for c in txt)):
+            return  # chatter, not an address
         self.busy = True
         try:
             try: await m.delete()
             except discord.HTTPException: pass
-            err = await self.set_usd(usd)
             try:
-                await self._go(self.last_i, "amount" if err else "address", err, deferred=True)
+                if self.step == "amount":
+                    err = await self.set_usd(usd)
+                    await self._go(self.last_i, "amount" if err else "address", err, deferred=True)
+                else:
+                    self.address, self.memo = txt, None
+                    await self.to_confirm(self.last_i)
             except discord.HTTPException:
                 waiting.pop(self.channel_id, None)
                 await m.channel.send(f"{m.author.mention} this menu expired. Press **Start swap** again.")
@@ -443,6 +514,7 @@ class Wizard(discord.ui.View):
     async def open_search(self, i): await i.response.send_modal(SearchModal(self))
     async def ask_amount(self, i): await i.response.send_modal(AmountModal(self))
     async def ask_address(self, i): await i.response.send_modal(AddressModal(self))
+    async def ask_memo(self, i): await i.response.send_modal(MemoModal(self))
 
     async def back(self, i):
         self.query, self.page = "", 0
@@ -457,7 +529,8 @@ class Wizard(discord.ui.View):
         if latest_order(i.channel_id):
             self.stop()
             return await i.response.edit_message(content="This ticket already has a swap.", embed=None, view=None)
-        await i.response.edit_message(embed=discord.Embed(title="Creating your order...", color=0x5865F2), view=None)
+        await i.response.edit_message(embed=discord.Embed(title="⏳ Creating your order…", color=BLURPLE,
+                                                         description="Hang tight, this only takes a few seconds."), view=None)
         try:
             params = dict(fromCcy=self.send, toCcy=self.recv, toAddress=self.address, amount=self.amount,
                           direction="from", type=RATE_TYPE)
@@ -474,14 +547,17 @@ class Wizard(discord.ui.View):
         if not ok:
             print("MISMATCH", o.get("id"))
             return await i.edit_original_response(view=None, embed=discord.Embed(
-                title="Order didn't match your request", color=0xED4245,
-                description="For safety I won't show a deposit address. Do NOT send funds. Press Start swap to try again."))
+                title="🚫 Order didn't match your request", color=RED,
+                description="For safety I won't show a deposit address. **Do NOT send funds.** Press **Start swap** to try again."))
         db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,NULL)",
-                   (o["id"], o["token"], i.user.id, i.channel_id, o["status"], time.time())); db.commit()
+                   (o["id"], o["token"], i.user.id, i.channel_id, o["status"], time.time()))
+        db.execute("INSERT OR REPLACE INTO addresses VALUES(?,?,?,?,?)",
+                   (i.user.id, self.recv, self.address, self.memo, time.time())); db.commit()
         try:
             await i.channel.send(i.user.mention, embed=invoice_embed(o), view=EmergencyView())
             await i.edit_original_response(view=None, embed=discord.Embed(
-                title="Invoice posted in this ticket ✅", color=0x57F287))
+                title="✅ Invoice posted below", color=GREEN,
+                description=f"Your {self.recv} address was saved for next time. I'll post every update in this ticket."))
         except discord.HTTPException:
             await i.edit_original_response(embed=invoice_embed(o), view=None)
 
@@ -489,15 +565,20 @@ class Wizard(discord.ui.View):
 def invoice_embed(o):
     f, t = o["from"], o["to"]
     left = int(o.get("time", {}).get("left") or 0)
-    e = discord.Embed(title=f'Invoice · order {o["id"]}', color=0xFEE75C, url=f'https://ff.io/order/{o["id"]}')
-    e.add_field(name="1. Send EXACTLY", value=f'```{f["amount"]} {f["code"]}```', inline=False)
-    e.add_field(name="2. To this address", value=f'```{f["address"]}```', inline=False)
+    e = discord.Embed(title=f'🧾 Invoice · {f["code"]} ➜ {t["code"]}', color=GOLD, url=f'https://ff.io/order/{o["id"]}',
+                      description="Send the **exact amount** below to the **deposit address**. "
+                                  "Your swap starts automatically once the deposit arrives.")
+    e.set_author(name=f'Crypto Swaps  ·  Order {o["id"]}')
+    e.add_field(name="📤 Send exactly", value=f'```{f["amount"]} {f["code"]}```', inline=False)
+    e.add_field(name="📮 Deposit address", value=f'```{f["address"]}```', inline=False)
     if f.get("tagValue"):
-        e.add_field(name=f'Deposit {f.get("tag") or "memo"} (required)', value=f'```{f["tagValue"]}```', inline=False)
-    e.add_field(name="You receive (est.)", value=f'{t["amount"]} {t["code"]}')
-    e.add_field(name="Payout address", value=f'`{t["address"]}`', inline=False)
-    if left: e.add_field(name="Expires", value=f"<t:{int(time.time()) + left}:R>")
-    e.set_footer(text=f'Send only {f["code"]} on the {f.get("network") or f["code"]} network. Wrong amount/coin may delay or lose funds.')
+        e.add_field(name=f'🏷️ Deposit {f.get("tag") or "memo"} (required)', value=f'```{f["tagValue"]}```', inline=False)
+    e.add_field(name="📥 You receive (est.)", value=f'**{t["amount"]}** {t["code"]}')
+    if left: e.add_field(name="⏳ Expires", value=f"<t:{int(time.time()) + left}:R>")
+    e.add_field(name="🏦 Payout address", value=f'`{t["address"]}`', inline=False)
+    e.set_footer(text=f'⚠️ Send only {f["code"]} on the {f.get("network") or f["code"]} network. '
+                      "A wrong amount, coin or network may delay or lose funds.")
+    e.timestamp = discord.utils.utcnow()
     return e
 
 
@@ -558,17 +639,39 @@ class EmergencyView(discord.ui.View):
 
 
 # ---------- status polling ----------
-async def notify(uid, ch_id, o):
+FLOW = ["Deposit", "Confirming", "Exchange", "Payout"]
+IDX = {"NEW": 0, "PENDING": 1, "EXCHANGE": 2, "WITHDRAW": 3, "DONE": 4}
+ICON = {"NEW": "⏳", "PENDING": "🔄", "EXCHANGE": "🔁", "WITHDRAW": "📤", "DONE": "✅", "EXPIRED": "⌛", "EMERGENCY": "🚨"}
+
+
+def tracker(st):
+    n = IDX.get(st, 0)
+    return "  ›  ".join(("✅" if k < n else "🔵" if k == n else "⚪") + f" {name}" for k, name in enumerate(FLOW))
+
+
+def status_embed(o):
     st = o["status"]
-    color = 0x57F287 if st == "DONE" else 0xED4245 if st in ("EXPIRED", "EMERGENCY") else 0x5865F2
-    e = discord.Embed(title=f'Order {o["id"]}: {STATUS.get(st, st)}', color=color, url=f'https://ff.io/order/{o["id"]}')
+    f, t = o.get("from") or {}, o.get("to") or {}
+    e = discord.Embed(title=f'{ICON.get(st, "ℹ️")} {STATUS.get(st, st)}', url=f'https://ff.io/order/{o["id"]}',
+                      color=GREEN if st == "DONE" else RED if st in ("EXPIRED", "EMERGENCY") else BLURPLE)
+    e.set_author(name=f'Crypto Swaps  ·  Order {o["id"]}  ·  {f.get("code", "?")} ➜ {t.get("code", "?")}')
+    e.description = ("No deposit arrived in time, so this order was cancelled. Nothing was charged." if st == "EXPIRED" else
+                     "This order needs your decision. Press the red **Something went wrong?** button." if st == "EMERGENCY"
+                     else tracker(st))
     tx = o.get("tx") or {}
     tin, tout = (tx.get("in") or {}), (tx.get("out") or {})
-    if tin.get("id"): e.add_field(name="Deposit TxID", value=f'```{tin["id"]}```', inline=False)
+    if tin.get("id"): e.add_field(name="📥 Deposit TxID", value=f'```{tin["id"]}```', inline=False)
     if tout.get("id"):
-        e.add_field(name="Payout TxID", value=f'```{tout["id"]}```', inline=False)
-        e.add_field(name="Received", value=f'{tout.get("amount") or o["to"]["amount"]} {o["to"]["code"]}')
+        e.add_field(name="📤 Payout TxID", value=f'```{tout["id"]}```', inline=False)
+        e.add_field(name="💰 You received", value=f'**{tout.get("amount") or t.get("amount")}** {t.get("code", "")}')
     if st in FINAL: e.set_footer(text=f"This ticket closes in {CLOSE_DELAY // 60} minutes.")
+    e.timestamp = discord.utils.utcnow()
+    return e
+
+
+async def notify(uid, ch_id, o):
+    st = o["status"]
+    e = status_embed(o)
     try:
         ch = bot.get_channel(ch_id) if ch_id else None
         if ch: await ch.send(f"<@{uid}>", embed=e, view=None if st in FINAL else EmergencyView())
@@ -618,8 +721,8 @@ async def on_message(m: discord.Message):
     w = waiting.get(m.channel.id)
     if not w: return
     if w.is_finished(): waiting.pop(m.channel.id, None); return
-    if w.user.id == m.author.id and w.step == "amount":
-        await w.on_amount_text(m)
+    if w.user.id == m.author.id and w.step in ("amount", "address"):
+        await w.on_text(m)
 
 
 @bot.event
