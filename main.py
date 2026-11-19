@@ -143,8 +143,23 @@ class TicketView(discord.ui.View):
             return await i.response.send_message("Only the ticket owner can close this.", ephemeral=True)
         o = latest_order(i.channel_id)
         if o and o[3] not in FINAL:
-            return await i.response.send_message("A swap is still in progress. Wait until it finishes "
-                                                 "(or use the red button if it's stuck).", ephemeral=True)
+            await i.response.defer(ephemeral=True)
+            try:
+                st = (await ff("order", id=o[0], token=o[1]))["status"]  # live status, not the saved one
+            except (FFError, KeyError, aiohttp.ClientError, asyncio.TimeoutError):
+                st = None
+            if st == "NEW":
+                text = ("Cancel this order and close the ticket?\n**Don't send a deposit to its address afterwards.** "
+                        "If you've already sent one, press Keep order.")
+            elif st in FINAL:
+                text = "This order is finished. Close the ticket?"
+            elif st is None:
+                text = ("I couldn't check this order's status right now. Closing the ticket doesn't cancel anything on "
+                        "FixedFloat, and I'll keep DMing you updates. If you've already sent a deposit, press Keep order.")
+            else:
+                return await i.followup.send("A swap is in progress (your deposit was detected). Wait until it finishes, "
+                                             "or use the red button if it's stuck.", ephemeral=True)
+            return await i.followup.send(text, view=CancelConfirm(i.user.id, force=st is None), ephemeral=True)
         await i.response.send_message("Closing...", ephemeral=True)
         db.execute("DELETE FROM tickets WHERE channel_id=?", (i.channel_id,))
         db.execute("UPDATE orders SET channel_id=NULL WHERE channel_id=?", (i.channel_id,)); db.commit()
@@ -182,26 +197,58 @@ async def setup(inter: discord.Interaction, category: discord.CategoryChannel | 
 
 
 # ---------- swap ----------
-POPULAR = ["BTC", "ETH", "LTC", "XMR", "SOL", "USDTTRC", "USDTETH", "USDTBSC", "USDTSOL", "USDCETH",
-           "BNB", "XRP", "DOGE", "TRX", "TON", "ADA", "BCH", "DASH", "ZEC", "AVAX", "DOT", "XLM", "ETC",
-           "BTCLN", "MATIC"]
+POP = ["BTC", "ETH", "LTC", "USDT", "USDC", "XMR", "SOL", "BNB", "XRP", "DOGE", "TRX", "TON", "ADA", "BCH",
+       "DASH", "ZEC", "AVAX", "DOT", "XLM", "ETC", "MATIC", "DAI", "SHIB", "LINK", "ATOM"]
+NET_ORDER = ["TRC20", "BEP20", "ERC20", "SOL", "POLYGON", "ARBITRUM", "OPTIMISM", "BASE", "AVAXC", "TON"]
+NET_NAMES = {"TRC20": "Tron", "BEP20": "BNB Smart Chain", "ERC20": "Ethereum", "SOL": "Solana", "POLYGON": "Polygon",
+             "ARBITRUM": "Arbitrum One", "OPTIMISM": "Optimism", "BASE": "Base", "AVAXC": "Avalanche C-Chain", "TON": "TON"}
+NET_ALIAS = {"BEP20": ("BEP20", "BSC", "BNB"), "TRC20": ("TRC20", "TRX", "TRON"), "ERC20": ("ERC20", "ETH")}
+# Popular pairs shown on the start screen: ((coin, network or None), (coin, network or None)). Edit freely.
+PAIRS = [(("LTC", None), ("USDT", "BEP20")), (("USDT", "BEP20"), ("LTC", None)),
+         (("BTC", None), ("USDT", "TRC20")), (("USDT", "TRC20"), ("BTC", None))]
 
 
-def ordered(field):
-    ok = [c for c in ccies if c.get(field)]
-    by = {c["code"]: c for c in ok}
-    return [by[k] for k in POPULAR if k in by] + [c for c in ok if c["code"] not in POPULAR]
+def ticker(c): return (c.get("coin") or c["code"])
 
 
-def search(field, q):
-    q = q.lower().strip()
-    return [c for c in ordered(field) if q in c["code"].lower() or q in c["name"].lower()
-            or q in c["network"].lower()]
+def groups(field):
+    d = {}
+    for c in ccies:
+        if c.get(field): d.setdefault(ticker(c), []).append(c)
+    return d
 
 
-def btn_label(c):
-    coin = c.get("coin") or c["code"]
-    return (coin if c["network"] in (coin, c["code"]) else f'{coin} ({c["network"]})')[:80]
+def multi_net(tick): return len({c["network"] for c in ccies if ticker(c) == tick}) > 1
+
+
+def find(field, tick, net=None):
+    nets = NET_ALIAS.get(net, (net,)) if net else ()
+    for c in ccies:
+        if not c.get(field) or ticker(c).upper() != tick: continue
+        if not net or c["network"].upper() in nets or c["code"].upper() in [tick + n for n in nets]: return c
+
+
+def short(code):
+    c = next((c for c in ccies if c["code"] == code), None)
+    if not c: return code or "-"
+    t = ticker(c)
+    return f'{t} ({c["network"]})' if c["network"] and multi_net(t) else t
+
+
+def ticker_of(code):
+    c = next((c for c in ccies if c["code"] == code), None)
+    return ticker(c) if c else code
+
+
+def clean_name(n): return re.sub(r"\s*\(.*?\)\s*$", "", n or "")
+
+
+def coin_pool(field, query=""):
+    g, q = groups(field), query.lower().strip()
+    keys = [k for k, v in g.items() if not q or q in k.lower() or any(
+        q in x["name"].lower() or q in x["network"].lower() or q in x["code"].lower() for x in v)]
+    keys.sort(key=lambda k: (POP.index(k) if k in POP else 999, k))
+    return keys[:25], len(keys)
 
 
 def coin_label(code):
@@ -213,15 +260,14 @@ class SearchModal(discord.ui.Modal):
     def __init__(self, w):
         super().__init__(title="Search coins")
         self.w = w
-        self.q = discord.ui.TextInput(label="Coin name, ticker or network (empty = all)", required=False, max_length=40)
+        self.q = discord.ui.TextInput(label="Coin name or ticker (empty = all)", required=False, max_length=40)
         self.add_item(self.q)
 
     async def on_submit(self, i: discord.Interaction):
         w, text = self.w, self.q.value.strip()
-        field = "send" if w.step == "send" else "recv"
-        if text and not search(field, text):
+        if text and not coin_pool(w.step, text)[1]:
             return await i.response.send_message("No coins found. Try another name.", ephemeral=True)
-        w.query, w.page = text, 0
+        w.query = text
         await w._go(i, w.step)
 
 
@@ -301,18 +347,19 @@ class MemoModal(discord.ui.Modal):
 
 
 class Wizard(discord.ui.View):
-    """One message in the ticket that walks through: send coin -> receive coin -> amount -> address -> confirm."""
-    TITLES = {"send": "Choose the coin you send", "recv": "Choose the coin you receive",
+    """One message in the ticket: start (popular pairs) -> coin -> network -> coin -> network -> amount -> address -> confirm."""
+    TITLES = {"home": "Start a swap", "send": "Which coin are you sending?", "send_net": "Which network?",
+              "recv": "Which coin do you want to receive?", "recv_net": "Which network?",
               "amount": "How much do you want to swap?", "address": "Where should we send it?",
               "memo": "One more detail: memo / tag", "confirm": "Review your swap"}
-    STEPNO = {"send": 1, "recv": 2, "amount": 3, "address": 4, "memo": 4, "confirm": 4}
-    PREV = {"recv": "send", "amount": "recv", "address": "amount", "memo": "address", "confirm": "address"}
+    STEPNO = {"send": 1, "send_net": 1, "recv": 2, "recv_net": 2, "amount": 3, "address": 4, "memo": 4, "confirm": 5}
 
     def __init__(self, user, channel_id=None):
         super().__init__(timeout=900)
         self.user, self.channel_id, self.last_i, self.busy, self.usd = user, channel_id, None, False, None
-        self.step, self.page, self.pages, self.query, self.notice = "send", 0, 1, "", None
-        self.send = self.recv = self.amount = self.address = self.memo = self.est = self.limits = None
+        self.step, self.query, self.notice, self.pair, self.saved = "home", "", None, False, None
+        self.send = self.recv = self.send_coin = self.recv_coin = None
+        self.amount = self.address = self.memo = self.est = self.limits = None
         self.render()
 
     async def interaction_check(self, i):
@@ -321,30 +368,73 @@ class Wizard(discord.ui.View):
         return False
 
     def dst(self): return next((c for c in ccies if c["code"] == self.recv), None)
+    def needs_memo(self): return bool((self.dst() or {}).get("tag"))
+
+    def reset(self):
+        self.query, self.pair, self.usd = "", False, None
+        self.send = self.recv = self.send_coin = self.recv_coin = None
+        self.amount = self.address = self.memo = self.est = self.limits = None
+
+    def entries(self, side, tick):
+        es = [c for c in ccies if c.get(side) and ticker(c) == tick]
+        return sorted(es, key=lambda c: NET_ORDER.index(c["network"].upper()) if c["network"].upper() in NET_ORDER else 99)
+
+    def pairs(self):
+        out = []
+        for x, y in PAIRS:
+            a, b = find("send", *x), find("recv", *y)
+            if a and b and a["code"] != b["code"]: out.append((a, b))
+        return out
+
+    def prev_step(self):
+        st = self.step
+        if st == "send": return "home"
+        if st == "send_net": return "send"
+        if st == "recv": return "send_net" if len(self.entries("send", self.send_coin)) > 1 else "send"
+        if st == "recv_net": return "recv"
+        if st == "amount":
+            if self.pair: return "home"
+            return "recv_net" if len(self.entries("recv", self.recv_coin)) > 1 else "recv"
+        return "address" if st in ("memo", "confirm") else "amount"
 
     def _btn(self, label, cb, style=discord.ButtonStyle.secondary, row=None, disabled=False):
         b = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
         b.callback = cb
         self.add_item(b)
 
+    def _select(self, placeholder, options, cb, row=0):
+        sel = discord.ui.Select(placeholder=placeholder, options=options, row=row)
+        async def _cb(i): await cb(i, sel.values[0])
+        sel.callback = _cb
+        self.add_item(sel)
+
     def render(self):
         self.clear_items()
-        self.saved = get_saved(self.user.id, self.recv) if self.step == "address" and self.recv else None
-        if self.step in ("send", "recv"):
-            field = "send" if self.step == "send" else "recv"
-            pool = search(field, self.query) if self.query else ordered(field)
-            if self.step == "recv": pool = [c for c in pool if c["code"] != self.send]
-            self.pages = max(1, -(-len(pool) // 20))
-            self.page = max(0, min(self.page, self.pages - 1))
-            for n, c in enumerate(pool[self.page * 20:(self.page + 1) * 20]):
-                self._btn(btn_label(c), self._pick(c["code"]), row=n // 5)
-            self._btn("◀", self.prev, row=4, disabled=self.page == 0)
-            self._btn("▶", self.next, row=4, disabled=self.page >= self.pages - 1)
-            self._btn("🔍 Search", self.open_search, row=4)
-            if self.step == "recv": self._btn("Back", self.back, row=4)
-            self._btn("Cancel", self.cancel, discord.ButtonStyle.danger, row=4)
+        st = self.step
+        self.saved = get_saved(self.user.id, self.recv) if st == "address" and self.recv else None
+        if st == "home":
+            ps = self.pairs()
+            for n, (a, b) in enumerate(ps):
+                self._btn(f'{short(a["code"])} ➜ {short(b["code"])}'[:80], self._pair(a, b), row=n // 2)
+            self._btn("🔎 Custom swap", self.custom, discord.ButtonStyle.primary, row=(len(ps) + 1) // 2)
             return
-        if self.step == "address" and self.saved:
+        if st in ("send", "recv"):
+            by = groups(st)
+            keys, _ = coin_pool(st, self.query)
+            opts = [discord.SelectOption(label=k, description=clean_name(by[k][0]["name"])[:100] or None, value=k) for k in keys]
+            if opts: self._select("Choose a coin…", opts, self.pick_coin)
+            self._btn("🔍 Search", self.open_search, row=1)
+            self._btn("Back", self.back, row=1)
+            return
+        if st in ("send_net", "recv_net"):
+            side = st[:-4]
+            es = self.entries(side, self.send_coin if side == "send" else self.recv_coin)
+            opts = [discord.SelectOption(label=c["network"] or c["code"], value=c["code"],
+                                         description=NET_NAMES.get(c["network"].upper())) for c in es][:25]
+            self._select("Choose a network…", opts, self.pick_net)
+            self._btn("Back", self.back, row=1)
+            return
+        if st == "address" and self.saved:
             self._btn("✅ Use saved address", self.use_saved, discord.ButtonStyle.success)
             self._btn("Enter new address", self.ask_address)
             self._btn("Back", self.back)
@@ -352,32 +442,42 @@ class Wizard(discord.ui.View):
             self._btn("🗑 Forget saved", self.forget)
             return
         main = {"amount": ("Enter amount", self.ask_amount), "address": ("Enter address", self.ask_address),
-                "memo": ("Enter memo", self.ask_memo), "confirm": ("Confirm swap", self.confirm)}[self.step]
+                "memo": ("Enter memo", self.ask_memo), "confirm": ("Confirm swap", self.confirm)}[st]
         self._btn(main[0], main[1], discord.ButtonStyle.success)
         self._btn("Back", self.back)
         self._btn("Cancel", self.cancel, discord.ButtonStyle.danger)
 
     def embed(self):
-        n = self.STEPNO[self.step]
-        e = discord.Embed(title=self.TITLES[self.step], color=GREEN if self.step == "confirm" else BLURPLE)
-        e.set_author(name=f"Crypto Swaps  ·  Step {n} of 4   {'▰' * n}{'▱' * (4 - n)}")
-        e.set_footer(text="Cancel starts over")
+        st = self.step
+        n = self.STEPNO.get(st)
+        e = discord.Embed(title=self.TITLES[st], color=GREEN if st == "confirm" else BLURPLE)
+        e.set_author(name="Crypto Swaps" if n is None else f"Crypto Swaps  ·  Step {n} of 5   {'▰' * n}{'▱' * (5 - n)}")
+        e.set_footer(text="Powered by FixedFloat" if st == "home" else
+                     "Back returns to the previous step" if st in ("send", "recv", "send_net", "recv_net") else "Cancel starts over")
         lines = []
         if self.notice: lines.append(f"⚠️ **{self.notice}**")
-        if self.step in ("send", "recv"):
-            lines.append("Tap a coin below, or use **🔍 Search** to find any other coin." if not self.query
-                         else f'Results for **"{self.query}"**. Search with an empty box to see all coins.')
-            e.set_footer(text=f"Page {self.page + 1} of {self.pages}  ·  Cancel starts over")
-        elif self.step == "amount":
+        if st == "home":
+            lines.append("Pick a popular pair to start fast, or build your own swap. "
+                         "You'll type the amount in USD, then your address.")
+        elif st in ("send", "recv"):
+            _, total = coin_pool(st, self.query)
+            lines.append(f"Choose the coin you want to **{'send' if st == 'send' else 'receive'}**, or use **🔍 Search**."
+                         if not self.query else f'Results for **"{self.query}"**. Search with an empty box to see all coins.')
+            if total > 25: lines.append(f"Showing the first 25 of {total}. Narrow it down with Search.")
+        elif st in ("send_net", "recv_net"):
+            tick = self.send_coin if st == "send_net" else self.recv_coin
+            lines.append(f"**{tick}** runs on more than one network. Pick the network your wallet "
+                         f"{'sends on' if st == 'send_net' else 'should receive on'}. The wrong network can lose funds.")
+        elif st == "amount":
             lines.append(("💬 **Type the amount in USD in this chat** (for example `100`), or press **Enter amount**."
                           if CHAT_INPUT else "Press **Enter amount** and type how much you want to swap in USD.")
-                         + f"\nI'll work out how much {self.send} that is.")
-        elif self.step == "address":
+                         + f"\nI'll work out how much {short(self.send)} that is.")
+        elif st == "address":
             what = f"your **{coin_label(self.recv)}** address"
             lines.append((f"💬 **Type {what} in this chat**, or press **Enter " + ("new " if self.saved else "") + "address**."
                           if CHAT_INPUT else f"Press **Enter address** and paste {what}.")
                          + "\nDouble-check it: swaps can't be reversed.")
-        elif self.step == "memo":
+        elif st == "memo":
             tag = (self.dst() or {}).get("tag") or "memo"
             lines.append(f"{coin_label(self.recv)} needs a **{tag}**. Press **Enter memo** and paste it exactly: "
                          "a wrong or missing one can lose funds.")
@@ -386,21 +486,21 @@ class Wizard(discord.ui.View):
             e.set_footer(text=f"Rate: {RATE_TYPE} (the final amount can differ slightly)  ·  By confirming you accept the terms")
         e.description = "\n\n".join(lines) or None
         if self.send:
-            val = f"**{self.amount}** {self.send}" if self.amount else coin_label(self.send)
+            val = f"**{self.amount}** {short(self.send)}" if self.amount else short(self.send)
             if self.amount and self.usd: val += f"\n≈ {money(self.usd)}"
             e.add_field(name="📤 You send", value=val)
         if self.recv:
-            e.add_field(name="📥 You receive", value=f"≈ **{self.est}** {self.recv}" if self.est else coin_label(self.recv))
-        if self.step == "amount" and self.limits:
+            e.add_field(name="📥 You receive", value=f"≈ **{self.est}** {short(self.recv)}" if self.est else short(self.recv))
+        if st == "amount" and self.limits:
             mn, mx, mnc, mxc = self.limits
             parts = []
-            if mn is not None: parts.append(f"▫️ **Minimum** {money(mn)} ({mnc} {self.send})")
-            if mx is not None: parts.append(f"▫️ **Maximum** {money(mx)} ({mxc} {self.send})")
+            if mn is not None: parts.append(f"▫️ **Minimum** {money(mn)} ({mnc} {ticker_of(self.send)})")
+            if mx is not None: parts.append(f"▫️ **Maximum** {money(mx)} ({mxc} {ticker_of(self.send)})")
             if parts: e.add_field(name="📏 Limits for this swap", value="\n".join(parts), inline=False)
-        if self.step == "address" and self.saved:
+        if st == "address" and self.saved:
             e.add_field(name="💾 Saved address", value=f"```{self.saved['address']}```"
                         + (f"\nMemo: `{self.saved['memo']}`" if self.saved["memo"] else ""), inline=False)
-        if self.step == "confirm":
+        if st == "confirm":
             e.add_field(name="📮 Payout address", value=f"```{self.address}```", inline=False)
             if self.memo: e.add_field(name="🏷️ Memo / tag", value=f"```{self.memo}```", inline=False)
         return e
@@ -413,6 +513,56 @@ class Wizard(discord.ui.View):
         if deferred: await i.edit_original_response(embed=self.embed(), view=self)
         else: await i.response.edit_message(embed=self.embed(), view=self)
 
+    # ----- start screen / coin + network selection
+    def _pair(self, a, b):
+        async def cb(i):
+            self.reset()
+            self.send, self.recv, self.send_coin, self.recv_coin, self.pair = a["code"], b["code"], ticker(a), ticker(b), True
+            await i.response.defer()
+            await self.load_limits()
+            await self._go(i, "amount", deferred=True)
+        return cb
+
+    async def custom(self, i):
+        self.reset()
+        await self._go(i, "send")
+
+    async def pick_coin(self, i, tick):
+        side = "send" if self.step == "send" else "recv"
+        setattr(self, f"{side}_coin", tick)
+        self.query = ""
+        es = self.entries(side, tick)
+        if len(es) == 1: await self.set_code(i, side, es[0]["code"])
+        else: await self._go(i, f"{side}_net")
+
+    async def pick_net(self, i, code):
+        await self.set_code(i, "send" if self.step == "send_net" else "recv", code)
+
+    async def set_code(self, i, side, code):
+        if side == "send":
+            self.send = code
+            return await self._go(i, "recv")
+        if code == self.send:
+            return await self._go(i, self.step, "Pick something different from the coin you're sending.")
+        self.recv = code
+        await i.response.defer()
+        await self.load_limits()
+        await self._go(i, "amount", deferred=True)
+
+    async def open_search(self, i): await i.response.send_modal(SearchModal(self))
+    async def ask_amount(self, i): await i.response.send_modal(AmountModal(self))
+    async def ask_address(self, i): await i.response.send_modal(AddressModal(self))
+    async def ask_memo(self, i): await i.response.send_modal(MemoModal(self))
+
+    async def back(self, i):
+        self.query = ""
+        await self._go(i, self.prev_step())
+
+    async def cancel(self, i):
+        self.reset()
+        await self._go(i, "home")
+
+    # ----- pricing
     async def load_limits(self):
         """Probe a ~$100 quote for this pair and read FixedFloat's min/max (converted to USD)."""
         self.limits = None
@@ -445,8 +595,12 @@ class Wizard(discord.ui.View):
             self.amount = self.est = None
             return f"Can't price ${usd:,.2f}: {e}"
 
-    def needs_memo(self): return bool((self.dst() or {}).get("tag"))
+    async def refresh_quote(self):
+        q = await ff("price", fromCcy=self.send, toCcy=self.recv, amount=self.amount, direction="from", type=RATE_TYPE)
+        if q.get("errors"): raise FFError(str(q["errors"]))
+        self.est = q["to"]["amount"]
 
+    # ----- address / memo / typed input
     async def to_confirm(self, i):
         """Ask for a memo if the coin needs one, otherwise re-price and show the confirmation."""
         if self.needs_memo() and not self.memo:
@@ -493,38 +647,7 @@ class Wizard(discord.ui.View):
     async def on_timeout(self):
         if waiting.get(self.channel_id) is self: del waiting[self.channel_id]
 
-    async def refresh_quote(self):
-        q = await ff("price", fromCcy=self.send, toCcy=self.recv, amount=self.amount, direction="from", type=RATE_TYPE)
-        if q.get("errors"): raise FFError(str(q["errors"]))
-        self.est = q["to"]["amount"]
-
-    def _pick(self, code):
-        async def cb(i):
-            self.query, self.page = "", 0
-            if self.step == "send": self.send = code; await self._go(i, "recv")
-            else:
-                self.recv = code
-                await i.response.defer()
-                await self.load_limits()
-                await self._go(i, "amount", deferred=True)
-        return cb
-
-    async def prev(self, i): self.page -= 1; await self._go(i, self.step)
-    async def next(self, i): self.page += 1; await self._go(i, self.step)
-    async def open_search(self, i): await i.response.send_modal(SearchModal(self))
-    async def ask_amount(self, i): await i.response.send_modal(AmountModal(self))
-    async def ask_address(self, i): await i.response.send_modal(AddressModal(self))
-    async def ask_memo(self, i): await i.response.send_modal(MemoModal(self))
-
-    async def back(self, i):
-        self.query, self.page = "", 0
-        await self._go(i, self.PREV[self.step])
-
-    async def cancel(self, i):
-        self.send = self.recv = self.amount = self.address = self.memo = self.est = self.usd = self.limits = None
-        self.query, self.page = "", 0
-        await self._go(i, "send")
-
+    # ----- create the order
     async def confirm(self, i: discord.Interaction):
         if latest_order(i.channel_id):
             self.stop()
@@ -557,7 +680,7 @@ class Wizard(discord.ui.View):
             await i.channel.send(i.user.mention, embed=invoice_embed(o), view=EmergencyView())
             await i.edit_original_response(view=None, embed=discord.Embed(
                 title="✅ Invoice posted below", color=GREEN,
-                description=f"Your {self.recv} address was saved for next time. I'll post every update in this ticket."))
+                description=f"Your {short(self.recv)} address was saved for next time. I'll post every update in this ticket."))
         except discord.HTTPException:
             await i.edit_original_response(embed=invoice_embed(o), view=None)
 
@@ -565,7 +688,7 @@ class Wizard(discord.ui.View):
 def invoice_embed(o):
     f, t = o["from"], o["to"]
     left = int(o.get("time", {}).get("left") or 0)
-    e = discord.Embed(title=f'🧾 Invoice · {f["code"]} ➜ {t["code"]}', color=GOLD, url=f'https://ff.io/order/{o["id"]}',
+    e = discord.Embed(title=f'🧾 Invoice · {short(f["code"])} ➜ {short(t["code"])}', color=GOLD, url=f'https://ff.io/order/{o["id"]}',
                       description="Send the **exact amount** below to the **deposit address**. "
                                   "Your swap starts automatically once the deposit arrives.")
     e.set_author(name=f'Crypto Swaps  ·  Order {o["id"]}')
@@ -625,9 +748,9 @@ async def close_ticket(ch):
 
 
 class CancelConfirm(discord.ui.View):
-    def __init__(self, user_id):
+    def __init__(self, user_id, force=False):
         super().__init__(timeout=120)
-        self.user_id = user_id
+        self.user_id, self.force = user_id, force
 
     async def interaction_check(self, i): return i.user.id == self.user_id
 
@@ -637,13 +760,14 @@ class CancelConfirm(discord.ui.View):
         if not row:
             return await i.response.edit_message(content="Nothing to cancel.", view=None)
         await i.response.defer()
-        try:
-            o = await ff("order", id=row[0], token=row[1])  # re-check: a deposit may have arrived meanwhile
-        except FFError as e:
-            return await i.edit_original_response(content=f"Couldn't check the order: {e}", view=None)
-        if o["status"] not in ("NEW",) + FINAL:
-            return await i.edit_original_response(
-                content="A deposit was just detected, so this order can't be cancelled now. Keep the ticket open.", view=None)
+        if not self.force:
+            try:
+                o = await ff("order", id=row[0], token=row[1])  # re-check: a deposit may have arrived meanwhile
+            except FFError as e:
+                return await i.edit_original_response(content=f"Couldn't check the order: {e}", view=None)
+            if o["status"] not in ("NEW",) + FINAL:
+                return await i.edit_original_response(
+                    content="A deposit was just detected, so this order can't be cancelled now. Keep the ticket open.", view=None)
         self.stop()
         await i.edit_original_response(content="Order cancelled. Closing this ticket...", view=None)
         try: await close_ticket(i.channel)
@@ -730,7 +854,7 @@ def status_embed(o):
     f, t = o.get("from") or {}, o.get("to") or {}
     e = discord.Embed(title=f'{ICON.get(st, "ℹ️")} {STATUS.get(st, st)}', url=f'https://ff.io/order/{o["id"]}',
                       color=GREEN if st == "DONE" else RED if st in ("EXPIRED", "EMERGENCY") else BLURPLE)
-    e.set_author(name=f'Crypto Swaps  ·  Order {o["id"]}  ·  {f.get("code", "?")} ➜ {t.get("code", "?")}')
+    e.set_author(name=f'Crypto Swaps  ·  Order {o["id"]}  ·  {short(f.get("code", "?"))} ➜ {short(t.get("code", "?"))}')
     e.description = ("No deposit arrived in time, so this order was cancelled. Nothing was charged." if st == "EXPIRED" else
                      "This order needs your decision. Press the red **Something went wrong?** button." if st == "EMERGENCY"
                      else tracker(st))
