@@ -618,8 +618,84 @@ class ResolveView(discord.ui.View):
         await i.response.send_modal(RefundModal(self.oid, self.tok))
 
 
+async def close_ticket(ch):
+    db.execute("DELETE FROM tickets WHERE channel_id=?", (ch.id,))
+    db.execute("UPDATE orders SET channel_id=NULL WHERE channel_id=?", (ch.id,)); db.commit()
+    await ch.delete(reason="order cancelled")
+
+
+class CancelConfirm(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+
+    async def interaction_check(self, i): return i.user.id == self.user_id
+
+    @discord.ui.button(label="Yes, cancel & close", style=discord.ButtonStyle.danger)
+    async def yes(self, i: discord.Interaction, b):
+        row = latest_order(i.channel_id)
+        if not row:
+            return await i.response.edit_message(content="Nothing to cancel.", view=None)
+        await i.response.defer()
+        try:
+            o = await ff("order", id=row[0], token=row[1])  # re-check: a deposit may have arrived meanwhile
+        except FFError as e:
+            return await i.edit_original_response(content=f"Couldn't check the order: {e}", view=None)
+        if o["status"] not in ("NEW",) + FINAL:
+            return await i.edit_original_response(
+                content="A deposit was just detected, so this order can't be cancelled now. Keep the ticket open.", view=None)
+        self.stop()
+        await i.edit_original_response(content="Order cancelled. Closing this ticket...", view=None)
+        try: await close_ticket(i.channel)
+        except discord.HTTPException as e: print("close failed", e)
+
+    @discord.ui.button(label="Keep order", style=discord.ButtonStyle.secondary)
+    async def no(self, i: discord.Interaction, b):
+        self.stop()
+        await i.response.edit_message(content="Okay, your order is still open.", view=None)
+
+
 class EmergencyView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
+
+    @discord.ui.button(label="📋 Copy details", style=discord.ButtonStyle.primary, custom_id="ff:copy")
+    async def copy(self, i: discord.Interaction, b):
+        row = latest_order(i.channel_id)
+        if not row or row[2] != i.user.id:
+            return await i.response.send_message("Only the ticket owner can use this.", ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        try:
+            o = await ff("order", id=row[0], token=row[1])
+        except FFError as e:
+            return await i.followup.send(f"Couldn't load the details: {e}", ephemeral=True)
+        f = o.get("from") or {}
+        if o["status"] != "NEW" or not f.get("address"):
+            return await i.followup.send(f'This order is: {STATUS.get(o["status"], o["status"])}. '
+                                         "Don't send a deposit for it.", ephemeral=True)
+        # plain text, one message each: address first, then amount (then the deposit memo only if the coin needs it)
+        for text in (f["address"], f["amount"], f.get("tagValue")):
+            if text in (None, ""): continue
+            text = str(text)
+            if any(c in text for c in "_*~|`"): text = f"`{text}`"  # keep markdown characters from changing the text
+            await i.followup.send(text, ephemeral=True)
+
+    @discord.ui.button(label="✖ Cancel order", style=discord.ButtonStyle.secondary, custom_id="ff:cancel")
+    async def cancel_order(self, i: discord.Interaction, b):
+        row = latest_order(i.channel_id)
+        if not row or row[2] != i.user.id:
+            return await i.response.send_message("Only the ticket owner can use this.", ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        try:
+            o = await ff("order", id=row[0], token=row[1])
+        except FFError as e:
+            return await i.followup.send(f"Couldn't check the order: {e}", ephemeral=True)
+        st = o["status"]
+        if st not in ("NEW",) + FINAL:
+            return await i.followup.send("Your deposit has already been detected, so this order can't be cancelled. "
+                                         "If something looks wrong, use the red button.", ephemeral=True)
+        text = ("Cancel this order and close the ticket?\n**Don't send a deposit to its address afterwards.** "
+                "If you've already sent one, press Keep order." if st == "NEW" else "This order is finished. Close the ticket?")
+        await i.followup.send(text, view=CancelConfirm(i.user.id), ephemeral=True)
 
     @discord.ui.button(label="Something went wrong?", style=discord.ButtonStyle.danger, custom_id="ff:emergency")
     async def em(self, i: discord.Interaction, b):
