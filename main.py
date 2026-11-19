@@ -325,19 +325,43 @@ def parse_usd(text):
     return float(n)
 
 
-async def usd_to_coin(code, usd):
-    """How much of `code` is worth `usd` dollars: mid-point of FixedFloat quotes against USDT."""
-    if code.startswith(("USDT", "USDC", "DAI", "TUSD", "FDUSD", "PYUSD")): return fmt(usd)
+FF_ERRORS = {"LIMIT_MIN": "that's below FixedFloat's minimum for this pair",
+             "LIMIT_MAX": "that's above FixedFloat's maximum for this pair"}
+STABLE = ("USDT", "USDC", "DAI", "TUSD", "FDUSD", "PYUSD")
+_prices: dict = {}  # code -> (time, USD per coin)
+
+
+def ff_errors(errs):
+    if isinstance(errs, str): errs = [errs]
+    return "; ".join(FF_ERRORS.get(str(e), str(e)) for e in errs)
+
+
+async def coin_usd_price(code):
+    """USD value of one coin: mid-point of FixedFloat quotes against USDT. Measured on a big enough
+    amount to be above any pair minimum (a tiny amount can hit the reference pair's own minimum)."""
+    if code.startswith(STABLE): return 1.0
+    hit = _prices.get(code)
+    if hit and time.time() - hit[0] < 45: return hit[1]
     ref = next((k for k in ("USDTTRC", "USDTETH", "USDTBSC", "USDTSOL")
                 if any(c["code"] == k and c.get("send") and c.get("recv") for c in ccies)), None)
     if not ref: raise FFError("USD pricing is unavailable right now")
-    hi = await ff("price", fromCcy=code, toCcy=ref, amount=fmt(usd), direction="to", type="float")
-    lo = await ff("price", fromCcy=ref, toCcy=code, amount=fmt(usd), direction="from", type="float")
-    for q in (hi, lo):
-        if q.get("errors"): raise FFError(str(q["errors"]))
-    coin = (float(hi["from"]["amount"]) + float(lo["to"]["amount"])) / 2
-    if coin <= 0: raise FFError("couldn't price that amount")
-    return fmt(coin)
+    last = None
+    for probe in (100, 500, 2500):
+        hi = await ff("price", fromCcy=code, toCcy=ref, amount=fmt(probe), direction="to", type="float")
+        lo = await ff("price", fromCcy=ref, toCcy=code, amount=fmt(probe), direction="from", type="float")
+        errs = list(hi.get("errors") or []) + list(lo.get("errors") or [])
+        if errs:
+            last = errs; continue
+        coin = (float(hi["from"]["amount"]) + float(lo["to"]["amount"])) / 2
+        if coin <= 0: raise FFError("couldn't price that coin")
+        _prices[code] = (time.time(), probe / coin)
+        return probe / coin
+    raise FFError(ff_errors(last))
+
+
+async def usd_to_coin(code, usd):
+    """How much of `code` is worth `usd` dollars."""
+    return fmt(usd / await coin_usd_price(code))
 
 
 class AmountModal(discord.ui.Modal):
@@ -624,10 +648,10 @@ class Wizard(discord.ui.View):
         """Probe a ~$100 quote for this pair and read FixedFloat's min/max (converted to USD)."""
         self.limits = None
         try:
-            probe = float(await usd_to_coin(self.send, 100))
-            q = await ff("price", fromCcy=self.send, toCcy=self.recv, amount=fmt(probe),
+            per = await coin_usd_price(self.send)  # USD value of one coin
+            q = await ff("price", fromCcy=self.send, toCcy=self.recv, amount=fmt(100 / per),
                          direction="from", type=RATE_TYPE)
-            f, per = q["from"], 100 / probe  # per = USD value of one coin
+            f = q["from"]
             mn, mx = f.get("min"), f.get("max")
             mn_usd = (round(math.ceil(round(float(mn) * per * 100, 6)) / 100 + MIN_BUFFER_USD, 2)
                       if mn not in (None, "") else None)
@@ -651,11 +675,12 @@ class Wizard(discord.ui.View):
             await self.refresh_quote()
         except (FFError, KeyError, ValueError, ZeroDivisionError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             self.amount = self.est = None
-            return f"Can't price ${usd:,.2f}: {e}"
+            if "FixedFloat's" in str(e): await self.load_limits()  # the shown limits may be out of date
+            return f"Can't swap ${usd:,.2f}: {e}"
 
     async def refresh_quote(self):
         q = await ff("price", fromCcy=self.send, toCcy=self.recv, amount=self.amount, direction="from", type=RATE_TYPE)
-        if q.get("errors"): raise FFError(str(q["errors"]))
+        if q.get("errors"): raise FFError(ff_errors(q["errors"]))
         self.est = q["to"]["amount"]
 
     # ----- address / memo / typed input
