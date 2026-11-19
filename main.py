@@ -3,7 +3,7 @@ Admin runs /setup once in the main channel -> panel with "Start a swap" button -
 channel -> menu (pick coins, enter details) -> confirm -> invoice -> live status + txids -> emergency button.
 Env: DISCORD_TOKEN, FF_API_KEY, FF_API_SECRET, DB_PATH (on your Railway volume), FF_RATE_TYPE (default float)
 """
-import os, re, hmac, hashlib, json, sqlite3, time, asyncio
+import os, re, math, hmac, hashlib, json, sqlite3, time, asyncio
 import aiohttp, discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -16,6 +16,7 @@ MAX_AGE = 3 * 86400      # stop polling orders older than this
 CLOSE_DELAY = 600        # seconds before a finished ticket channel is deleted
 FINAL = ("DONE", "EXPIRED")
 BLURPLE, GREEN, GOLD, RED = 0x5865F2, 0x57F287, 0xFEE75C, 0xED4245
+MIN_BUFFER_USD = float(os.getenv("MIN_BUFFER_USD", "0.01"))  # added on top of FixedFloat's minimum
 CHAT_INPUT = os.getenv("CHAT_INPUT", "1") == "1"  # type the USD amount in chat (needs Message Content Intent)
 TOS_TEXT = (
     "**By using this service you agree to the terms:** swaps are executed by a third party "
@@ -135,6 +136,8 @@ class TicketView(discord.ui.View):
         w = Wizard(i.user, i.channel_id)
         w.last_i = i
         await i.response.send_message(embed=w.embed(), view=w)
+        try: w.msg = await i.channel.fetch_message((await i.original_response()).id)
+        except discord.HTTPException: pass
 
     @discord.ui.button(label="Close ticket", style=discord.ButtonStyle.grey, custom_id="ff:close")
     async def close(self, i: discord.Interaction, b):
@@ -200,9 +203,35 @@ async def setup(inter: discord.Interaction, category: discord.CategoryChannel | 
 POP = ["BTC", "ETH", "LTC", "USDT", "USDC", "XMR", "SOL", "BNB", "XRP", "DOGE", "TRX", "TON", "ADA", "BCH",
        "DASH", "ZEC", "AVAX", "DOT", "XLM", "ETC", "MATIC", "DAI", "SHIB", "LINK", "ATOM"]
 NET_ORDER = ["TRC20", "BEP20", "ERC20", "SOL", "POLYGON", "ARBITRUM", "OPTIMISM", "BASE", "AVAXC", "TON"]
-NET_NAMES = {"TRC20": "Tron", "BEP20": "BNB Smart Chain", "ERC20": "Ethereum", "SOL": "Solana", "POLYGON": "Polygon",
-             "ARBITRUM": "Arbitrum One", "OPTIMISM": "Optimism", "BASE": "Base", "AVAXC": "Avalanche C-Chain", "TON": "TON"}
-NET_ALIAS = {"BEP20": ("BEP20", "BSC", "BNB"), "TRC20": ("TRC20", "TRX", "TRON"), "ERC20": ("ERC20", "ETH")}
+NET_INFO = {  # network key -> (full name, how people write it)
+    "BEP20": ("BNB Smart Chain", "BSC / BNB / BEP20"),
+    "TRC20": ("Tron", "TRX / Tron / TRC20"),
+    "ERC20": ("Ethereum", "ETH / Ethereum / ERC20"),
+    "SOL": ("Solana", "SOL / Solana / SPL"),
+    "POLYGON": ("Polygon", "MATIC / POL / Polygon"),
+    "ARBITRUM": ("Arbitrum One", "ARB / Arbitrum"),
+    "OPTIMISM": ("Optimism", "OP / Optimism"),
+    "BASE": ("Base", "Base / Coinbase L2"),
+    "AVAXC": ("Avalanche C-Chain", "AVAX / AVAXC / C-Chain"),
+    "TON": ("TON", "TON / The Open Network"),
+}
+NET_ALIAS = {"BEP20": ("BEP20", "BSC", "BNB"), "TRC20": ("TRC20", "TRX", "TRON"), "ERC20": ("ERC20", "ETH"),
+             "SOL": ("SOL", "SOLANA"), "POLYGON": ("POLYGON", "MATIC", "POL"), "ARBITRUM": ("ARBITRUM", "ARB"),
+             "OPTIMISM": ("OPTIMISM", "OP"), "BASE": ("BASE",), "AVAXC": ("AVAXC", "AVAX"), "TON": ("TON",)}
+COIN_INFO = {
+    "BTC": "Bitcoin · the original cryptocurrency", "ETH": "Ethereum · smart-contract platform",
+    "LTC": "Litecoin · fast, low-fee Bitcoin alternative", "USDT": "Tether · US dollar stablecoin (1 USDT ≈ $1)",
+    "USDC": "USD Coin · US dollar stablecoin (1 USDC ≈ $1)", "XMR": "Monero · private digital cash",
+    "SOL": "Solana · fast smart-contract blockchain", "BNB": "BNB · native coin of BNB Smart Chain",
+    "XRP": "XRP · fast payments coin (may need a destination tag)", "DOGE": "Dogecoin · the original meme coin",
+    "TRX": "Tron · low-fee smart-contract blockchain", "TON": "Toncoin · Telegram's blockchain",
+    "ADA": "Cardano · proof-of-stake blockchain", "BCH": "Bitcoin Cash · Bitcoin fork with low fees",
+    "DASH": "Dash · fast digital cash", "ZEC": "Zcash · privacy-focused coin",
+    "AVAX": "Avalanche · fast smart-contract blockchain", "DOT": "Polkadot · multi-chain network",
+    "XLM": "Stellar · low-cost payments network (may need a memo)", "ETC": "Ethereum Classic · the original Ethereum chain",
+    "MATIC": "Polygon · Ethereum scaling network", "DAI": "Dai · decentralized US dollar stablecoin",
+    "SHIB": "Shiba Inu · meme token", "LINK": "Chainlink · oracle network", "ATOM": "Cosmos · network of connected chains",
+}
 # Popular pairs shown on the start screen: ((coin, network or None), (coin, network or None)). Edit freely.
 PAIRS = [(("LTC", None), ("USDT", "BEP20")), (("USDT", "BEP20"), ("LTC", None)),
          (("BTC", None), ("USDT", "TRC20")), (("USDT", "TRC20"), ("BTC", None))]
@@ -238,6 +267,16 @@ def short(code):
 def ticker_of(code):
     c = next((c for c in ccies if c["code"] == code), None)
     return ticker(c) if c else code
+
+
+def net_key(n):
+    u = (n or "").upper()
+    return next((k for k, al in NET_ALIAS.items() if u in al), u)
+
+
+def net_desc(n):
+    info = NET_INFO.get(net_key(n))
+    return f"{info[1]} · {info[0]}" if info else None
 
 
 def clean_name(n): return re.sub(r"\s*\(.*?\)\s*$", "", n or "")
@@ -358,6 +397,7 @@ class Wizard(discord.ui.View):
         super().__init__(timeout=900)
         self.user, self.channel_id, self.last_i, self.busy, self.usd = user, channel_id, None, False, None
         self.step, self.query, self.notice, self.pair, self.saved = "home", "", None, False, None
+        self.msg = None  # the menu message (so it can be resent at the bottom)
         self.send = self.recv = self.send_coin = self.recv_coin = None
         self.amount = self.address = self.memo = self.est = self.limits = None
         self.render()
@@ -421,7 +461,7 @@ class Wizard(discord.ui.View):
         if st in ("send", "recv"):
             by = groups(st)
             keys, _ = coin_pool(st, self.query)
-            opts = [discord.SelectOption(label=k, description=clean_name(by[k][0]["name"])[:100] or None, value=k) for k in keys]
+            opts = [discord.SelectOption(label=k, description=(COIN_INFO.get(k) or clean_name(by[k][0]["name"]))[:100] or None, value=k) for k in keys]
             if opts: self._select("Choose a coin…", opts, self.pick_coin)
             self._btn("🔍 Search", self.open_search, row=1)
             self._btn("Back", self.back, row=1)
@@ -430,7 +470,7 @@ class Wizard(discord.ui.View):
             side = st[:-4]
             es = self.entries(side, self.send_coin if side == "send" else self.recv_coin)
             opts = [discord.SelectOption(label=c["network"] or c["code"], value=c["code"],
-                                         description=NET_NAMES.get(c["network"].upper())) for c in es][:25]
+                                         description=net_desc(c["network"])) for c in es][:25]
             self._select("Choose a network…", opts, self.pick_net)
             self._btn("Back", self.back, row=1)
             return
@@ -466,6 +506,7 @@ class Wizard(discord.ui.View):
             if total > 25: lines.append(f"Showing the first 25 of {total}. Narrow it down with Search.")
         elif st in ("send_net", "recv_net"):
             tick = self.send_coin if st == "send_net" else self.recv_coin
+            if COIN_INFO.get(tick): lines.append(f"💡 **{tick}** · {COIN_INFO[tick]}")
             lines.append(f"**{tick}** runs on more than one network. Pick the network your wallet "
                          f"{'sends on' if st == 'send_net' else 'should receive on'}. The wrong network can lose funds.")
         elif st == "amount":
@@ -496,7 +537,12 @@ class Wizard(discord.ui.View):
             parts = []
             if mn is not None: parts.append(f"▫️ **Minimum** {money(mn)} ({mnc} {ticker_of(self.send)})")
             if mx is not None: parts.append(f"▫️ **Maximum** {money(mx)} ({mxc} {ticker_of(self.send)})")
-            if parts: e.add_field(name="📏 Limits for this swap", value="\n".join(parts), inline=False)
+            if parts: e.add_field(name="📏 Limits for this swap", inline=False, value="\n".join(parts) + (
+                "\n*The minimum includes a small buffer for network fees.*" if mn is not None else ""))
+        if st in ("send_net", "recv_net"):
+            tick = self.send_coin if st == "send_net" else self.recv_coin
+            rows = [f"**{c['network']}** · {net_desc(c['network']) or 'network'}" for c in self.entries(st[:-4], tick)]
+            if rows: e.add_field(name="Available networks", value="\n".join(rows)[:1000], inline=False)
         if st == "address" and self.saved:
             e.add_field(name="💾 Saved address", value=f"```{self.saved['address']}```"
                         + (f"\nMemo: `{self.saved['memo']}`" if self.saved["memo"] else ""), inline=False)
@@ -506,11 +552,22 @@ class Wizard(discord.ui.View):
         return e
 
     async def _go(self, i, step, notice=None, deferred=False):
-        self.step, self.notice, self.last_i = step, notice, i
+        """Show `step`. Edits the menu in place, or resends it at the bottom if newer messages were posted."""
+        self.step, self.notice = step, notice
+        if i is not None: self.last_i = i
         if step in ("amount", "address"): waiting[self.channel_id] = self
         elif waiting.get(self.channel_id) is self: del waiting[self.channel_id]
         self.render()
-        if deferred: await i.edit_original_response(embed=self.embed(), view=self)
+        ch = bot.get_channel(self.channel_id)
+        stale = bool(ch and self.msg and getattr(ch, "last_message_id", None) not in (None, self.msg.id))
+        if stale:
+            if i is not None and not i.response.is_done(): await i.response.defer()
+            new = await ch.send(embed=self.embed(), view=self)
+            try: await ch.get_partial_message(self.msg.id).delete()
+            except discord.HTTPException: pass
+            self.msg = new
+        elif i is None and self.msg: await self.msg.edit(embed=self.embed(), view=self)
+        elif deferred or i is None: await (i or self.last_i).edit_original_response(embed=self.embed(), view=self)
         else: await i.response.edit_message(embed=self.embed(), view=self)
 
     # ----- start screen / coin + network selection
@@ -572,10 +629,11 @@ class Wizard(discord.ui.View):
                          direction="from", type=RATE_TYPE)
             f, per = q["from"], 100 / probe  # per = USD value of one coin
             mn, mx = f.get("min"), f.get("max")
-            mn_usd = float(mn) * per if mn not in (None, "") else None
+            mn_usd = (round(math.ceil(round(float(mn) * per * 100, 6)) / 100 + MIN_BUFFER_USD, 2)
+                      if mn not in (None, "") else None)
             mx_usd = float(mx) * per if mx not in (None, "") else None
             if mn_usd is not None or mx_usd is not None:
-                self.limits = (mn_usd, mx_usd, fmt(float(mn)) if mn_usd is not None else None,
+                self.limits = (mn_usd, mx_usd, fmt(mn_usd / per) if mn_usd is not None else None,
                                fmt(float(mx)) if mx_usd is not None else None)
         except (FFError, KeyError, ValueError, ZeroDivisionError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             print("limits unavailable", self.send, self.recv, e)
@@ -585,7 +643,7 @@ class Wizard(discord.ui.View):
         try:
             self.usd = usd
             if self.limits:
-                if self.limits[0] and usd < self.limits[0] * 0.98:
+                if self.limits[0] and usd + 1e-9 < self.limits[0]:
                     raise FFError(f"below the minimum of {money(self.limits[0])}")
                 if self.limits[1] and usd > self.limits[1] * 1.02:
                     raise FFError(f"above the maximum of {money(self.limits[1])}")
@@ -634,10 +692,10 @@ class Wizard(discord.ui.View):
             try:
                 if self.step == "amount":
                     err = await self.set_usd(usd)
-                    await self._go(self.last_i, "amount" if err else "address", err, deferred=True)
+                    await self._go(None, "amount" if err else "address", err)
                 else:
                     self.address, self.memo = txt, None
-                    await self.to_confirm(self.last_i)
+                    await self.to_confirm(None)
             except discord.HTTPException:
                 waiting.pop(self.channel_id, None)
                 await m.channel.send(f"{m.author.mention} this menu expired. Press **Start swap** again.")
