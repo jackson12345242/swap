@@ -1,7 +1,10 @@
-"""Ticket-based, non-custodial Discord swap bot for FixedFloat (ff.io).
-Admin runs /setup once in the main channel -> panel with "Start a swap" button -> private ticket
-channel -> menu (pick coins, enter details) -> confirm -> invoice -> live status + txids -> emergency button.
-Env: DISCORD_TOKEN, FF_API_KEY, FF_API_SECRET, DB_PATH (on your Railway volume), FF_RATE_TYPE (default float)
+"""JK's Crypto Exchange: ticket-based, non-custodial Discord swap bot for FixedFloat (ff.io).
+Admin runs /setup once in the main channel -> panel with "Start a swap" + "Available coins" buttons ->
+private ticket channel -> (terms, first swap only) -> menu (pick coins, enter details) -> confirm ->
+invoice -> live status + txids -> emergency button.
+Env: DISCORD_TOKEN, FF_API_KEY, FF_API_SECRET, DB_PATH (on your Railway volume), FF_RATE_TYPE (default float),
+     BRAND_IMAGE (direct URL of your logo, shown as a thumbnail on every embed),
+     RULES_CHANNEL (channel id people must read before swapping)
 """
 import os, re, math, hmac, hashlib, json, sqlite3, time, asyncio
 import aiohttp, discord
@@ -18,6 +21,9 @@ FINAL = ("DONE", "EXPIRED")
 BLURPLE, GREEN, GOLD, RED = 0x5865F2, 0x57F287, 0xFEE75C, 0xED4245
 MIN_BUFFER_USD = float(os.getenv("MIN_BUFFER_USD", "0.01"))  # added on top of FixedFloat's minimum
 CHAT_INPUT = os.getenv("CHAT_INPUT", "1") == "1"  # type the USD amount in chat (needs Message Content Intent)
+BRAND = "JK's Crypto Exchange"
+BRAND_IMAGE = os.getenv("BRAND_IMAGE", "")  # direct image URL (upload the logo to Discord, copy its link)
+RULES_CHANNEL = int(os.getenv("RULES_CHANNEL", "1573162844189495336"))
 TOS_TEXT = (
     "**By using this service you agree to the terms:** swaps are executed by a third party "
     "(FixedFloat). This bot never holds your funds. You are responsible for the receiving address, "
@@ -38,7 +44,18 @@ CREATE TABLE IF NOT EXISTS tickets(channel_id INT PRIMARY KEY, user_id INT, guil
 CREATE TABLE IF NOT EXISTS config(guild_id INT PRIMARY KEY, category_id INT, staff_role_id INT);
 CREATE TABLE IF NOT EXISTS addresses(user_id INT, code TEXT, address TEXT, memo TEXT, updated REAL,
     PRIMARY KEY(user_id, code));
+CREATE TABLE IF NOT EXISTS agreed(user_id INT PRIMARY KEY, ts REAL);
 """)
+
+
+def add_col(table, col, typ):  # tiny migration helper: safe to run on every start
+    try: db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+    except sqlite3.OperationalError: pass
+
+
+add_col("orders", "usd", "REAL")          # USD value of each swap (for the panel record)
+add_col("config", "panel_channel", "INT")  # where the panel lives, so the record can be updated
+add_col("config", "panel_msg", "INT")
 db.commit()
 
 class FFError(Exception): pass
@@ -74,11 +91,48 @@ def get_saved(uid, code):
     return {"address": r[0], "memo": r[1]} if r else None
 
 
-# ---------- panel + tickets ----------
+def has_agreed(uid):
+    return db.execute("SELECT 1 FROM agreed WHERE user_id=?", (uid,)).fetchone() is not None
+
+
+def brand(e):
+    """Put the logo on an embed (if BRAND_IMAGE is set)."""
+    if BRAND_IMAGE: e.set_thumbnail(url=BRAND_IMAGE)
+    return e
+
+
+def money(x): return f"${x:,.2f}"
+
+
+# ---------- panel ----------
+def panel_embed():
+    n, usd = db.execute("SELECT COUNT(*), COALESCE(SUM(usd), 0) FROM orders WHERE status='DONE'").fetchone()
+    e = discord.Embed(title=f"{BRAND} 💱", color=BLURPLE, description=(
+        "Click below to create your own private crypto swap ticket.\n\n"
+        "💹 **Record**\n"
+        f"**{n:,}** swaps completed  ·  **{money(usd)}** exchanged\n\n"
+        "1️⃣ **Press Start a swap**\n"
+        "2️⃣ **Pick your coins and type an amount in USD**\n"
+        "3️⃣ **Send the deposit and track it live**\n\n"
+        f"📖 Read <#{RULES_CHANNEL}> before every swap"))
+    e.set_footer(text="Powered by FixedFloat  ·  non-custodial")
+    return brand(e)
+
+
+async def update_panels():
+    """Refresh the Record line on every posted panel."""
+    for ch_id, msg_id in db.execute("SELECT panel_channel, panel_msg FROM config "
+                                    "WHERE panel_msg IS NOT NULL").fetchall():
+        ch = bot.get_channel(ch_id)
+        if not ch: continue
+        try: await ch.get_partial_message(msg_id).edit(embed=panel_embed())
+        except discord.HTTPException as e: print("panel update failed", e)
+
+
 class PanelView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
 
-    @discord.ui.button(label="Start a swap", style=discord.ButtonStyle.green, custom_id="ff:open")
+    @discord.ui.button(label="Start a swap", emoji="💱", style=discord.ButtonStyle.green, custom_id="ff:open")
     async def open(self, i: discord.Interaction, b):
         g, uid = i.guild, i.user.id
         cfg = db.execute("SELECT category_id, staff_role_id FROM config WHERE guild_id=?", (g.id,)).fetchone()
@@ -107,24 +161,69 @@ class PanelView(discord.ui.View):
             except discord.HTTPException as e:
                 return await i.followup.send(f"Couldn't create your ticket: {e}", ephemeral=True)
             db.execute("INSERT INTO tickets VALUES(?,?,?,?)", (ch.id, uid, g.id, time.time())); db.commit()
-            e = discord.Embed(title="🎫 Your swap ticket", color=BLURPLE, description=(
-                "Welcome! Here's how this works:\n\n"
-                "**1️⃣** Press **Start swap** below\n"
-                "**2️⃣** Pick the coin you send and the coin you receive\n"
-                "**3️⃣** Type the amount in USD, then your receiving address\n"
-                "**4️⃣** Confirm, send the deposit and watch the status update live here"))
-            e.add_field(name="📜 Terms", value=TOS_TEXT, inline=False)
-            e.set_footer(text="Private ticket · only you and staff can see this channel")
-            await ch.send(i.user.mention, embed=e, view=TicketView())
+            e = discord.Embed(title="🎫 Your private swap ticket", color=BLURPLE, description=(
+                "Only you and staff can see this channel.\n"
+                f"📖 Read <#{RULES_CHANNEL}> before your swap.\n\n"
+                "Your swap menu is right below. Lost it? Press **Open menu**."))
+            await ch.send(i.user.mention, embed=brand(e), view=TicketView())
+            await send_menu(ch, i.user)  # terms first if this is their first swap, otherwise straight to the menu
             await i.followup.send(f"Your ticket: {ch.mention}", ephemeral=True)
         finally:
             opening.discard(uid)
+
+    @discord.ui.button(label="Available coins", emoji="🪙", style=discord.ButtonStyle.secondary, custom_id="ff:coins")
+    async def coins(self, i: discord.Interaction, b):
+        if not ccies:
+            return await i.response.send_message("Coin list is still loading, try again in a moment.", ephemeral=True)
+        v = CoinsView()
+        await i.response.send_message(embed=v.embed(), view=v, ephemeral=True)
+
+
+# ---------- terms (first swap only) ----------
+def terms_embed():
+    e = discord.Embed(title="📜 Terms of service", color=GOLD, description=(
+        f"{TOS_TEXT}\n\n📖 Also read <#{RULES_CHANNEL}>.\n"
+        "You only need to agree **once**. After that you go straight to swapping."))
+    return brand(e)
+
+
+class TermsView(discord.ui.View):
+    def __init__(self, user):
+        super().__init__(timeout=900)
+        self.user = user
+
+    async def interaction_check(self, i):
+        if i.user.id == self.user.id: return True
+        await i.response.send_message("Only the ticket owner can use this.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="I agree", emoji="✅", style=discord.ButtonStyle.success)
+    async def agree(self, i: discord.Interaction, b):
+        db.execute("INSERT OR IGNORE INTO agreed VALUES(?,?)", (i.user.id, time.time())); db.commit()
+        self.stop()
+        w = Wizard(i.user, i.channel_id)
+        w.msg, w.last_i = i.message, i
+        await i.response.edit_message(embed=w.embed(), view=w)  # this message turns into the swap menu
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.grey)
+    async def decline(self, i: discord.Interaction, b):
+        await i.response.send_message("No problem. You need to accept the terms to swap. "
+                                      "You can close this ticket any time.", ephemeral=True)
+
+
+async def send_menu(ch, user):
+    """Post the terms (first swap) or the swap menu in a ticket channel."""
+    if has_agreed(user.id):
+        w = Wizard(user, ch.id)
+        w.msg = await ch.send(embed=w.embed(), view=w)
+    else:
+        await ch.send(embed=terms_embed(), view=TermsView(user))
 
 
 class TicketView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
 
-    @discord.ui.button(label="Start swap", style=discord.ButtonStyle.green, custom_id="ff:start")
+    @discord.ui.button(label="Open menu", emoji="💱", style=discord.ButtonStyle.green, custom_id="ff:start")
     async def start(self, i: discord.Interaction, b):
         t = db.execute("SELECT user_id FROM tickets WHERE channel_id=?", (i.channel_id,)).fetchone()
         if not t or t[0] != i.user.id:
@@ -133,6 +232,8 @@ class TicketView(discord.ui.View):
             return await i.response.send_message("This ticket already has a swap. Open a new ticket once it finishes.", ephemeral=True)
         if not ccies:
             return await i.response.send_message("Coin list is still loading, try again in a moment.", ephemeral=True)
+        if not has_agreed(i.user.id):
+            return await i.response.send_message(embed=terms_embed(), view=TermsView(i.user))
         w = Wizard(i.user, i.channel_id)
         w.last_i = i
         await i.response.send_message(embed=w.embed(), view=w)
@@ -182,20 +283,13 @@ async def setup(inter: discord.Interaction, category: discord.CategoryChannel | 
             category = await g.create_category("Swap Tickets", overwrites={
                 g.default_role: discord.PermissionOverwrite(view_channel=False),
                 g.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)})
-        e = discord.Embed(title="💱 Crypto Swaps", color=BLURPLE, description=(
-            "Swap between hundreds of coins at the best available rate. Fast, private and non-custodial."))
-        e.add_field(name="How it works", value=("1️⃣ Press **Start a swap**\n2️⃣ Pick your coins and type an amount in USD\n"
-                                                "3️⃣ Send the deposit and track it live"), inline=False)
-        e.add_field(name="Why use it", value="⚡ Hundreds of coins\n🔒 We never hold your funds\n🎫 A private ticket for every swap",
-                    inline=False)
-        e.add_field(name="📜 Terms", value=TOS_TEXT, inline=False)
-        e.set_footer(text="Powered by FixedFloat")
-        await inter.channel.send(embed=e, view=PanelView())
+        msg = await inter.channel.send(embed=panel_embed(), view=PanelView())
     except discord.HTTPException as ex:
         return await inter.followup.send(f"Setup failed (check my permissions: Manage Channels, "
                                          f"Send Messages, Embed Links): {ex}", ephemeral=True)
-    db.execute("INSERT OR REPLACE INTO config VALUES(?,?,?)",
-               (g.id, category.id, staff_role.id if staff_role else None)); db.commit()
+    db.execute("INSERT OR REPLACE INTO config(guild_id, category_id, staff_role_id, panel_channel, panel_msg) "
+               "VALUES(?,?,?,?,?)",
+               (g.id, category.id, staff_role.id if staff_role else None, inter.channel.id, msg.id)); db.commit()
     await inter.followup.send("Panel posted.", ephemeral=True)
 
 
@@ -295,6 +389,79 @@ def coin_label(code):
     return f'{c["name"]} ({c["network"]})' if c else (code or "-")
 
 
+# ---------- available coins (ephemeral browser) ----------
+def coin_catalog(query=""):
+    d = {}
+    for c in ccies: d.setdefault(ticker(c), []).append(c)
+    q = query.lower().strip()
+    keys = [k for k, v in d.items() if not q or q in k.lower() or any(
+        q in x["name"].lower() or q in x["network"].lower() for x in v)]
+    keys.sort(key=lambda k: (POP.index(k) if k in POP else 999, k))
+    return d, keys
+
+
+class CoinSearch(discord.ui.Modal):
+    def __init__(self, v):
+        super().__init__(title="Search coins")
+        self.v = v
+        self.q = discord.ui.TextInput(label="Coin name or ticker (empty = all)", required=False, max_length=40)
+        self.add_item(self.q)
+
+    async def on_submit(self, i: discord.Interaction):
+        self.v.query, self.v.page = self.q.value.strip(), 0
+        self.v.sync()
+        await i.response.edit_message(embed=self.v.embed(), view=self.v)
+
+
+class CoinsView(discord.ui.View):
+    """Paged list of every coin we can swap. Only the person who pressed the button sees it."""
+    PER = 12
+
+    def __init__(self, query=""):
+        super().__init__(timeout=300)
+        self.query, self.page, self.pages = query, 0, 1
+        self.sync()
+
+    def sync(self):
+        _, keys = coin_catalog(self.query)
+        self.pages = max(1, math.ceil(len(keys) / self.PER))
+        self.page = max(0, min(self.page, self.pages - 1))
+        self.prev.disabled = self.page == 0
+        self.next.disabled = self.page >= self.pages - 1
+
+    def embed(self):
+        d, keys = coin_catalog(self.query)
+        chunk = keys[self.page * self.PER:(self.page + 1) * self.PER]
+        lines = []
+        for k in chunk:
+            es = d[k]
+            s, r = any(c.get("send") for c in es), any(c.get("recv") for c in es)
+            flag = "↔️" if s and r else "📤" if s else "📥"
+            line = f"{flag} **{k}** · {clean_name(es[0]['name'])}"
+            nets = sorted({c["network"] for c in es if c["network"]}, key=lambda n: (
+                NET_ORDER.index(n.upper()) if n.upper() in NET_ORDER else 99, n))
+            if len(nets) > 1: line += "\n┗ " + "  ·  ".join(nets)
+            lines.append(line)
+        title = f"🪙 Available coins ({len(keys)})" + (f' · "{self.query}"' if self.query else "")
+        e = discord.Embed(title=title, color=BLURPLE, description="\n".join(lines) or "No coins found. Try another name.")
+        e.set_footer(text=f"Page {self.page + 1}/{self.pages}  ·  ↔️ send & receive  ·  📤 send only  ·  📥 receive only")
+        return brand(e)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev(self, i: discord.Interaction, b):
+        self.page -= 1; self.sync()
+        await i.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next(self, i: discord.Interaction, b):
+        self.page += 1; self.sync()
+        await i.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Search", emoji="🔍", style=discord.ButtonStyle.primary)
+    async def search(self, i: discord.Interaction, b):
+        await i.response.send_modal(CoinSearch(self))
+
+
 class SearchModal(discord.ui.Modal):
     def __init__(self, w):
         super().__init__(title="Search coins")
@@ -308,9 +475,6 @@ class SearchModal(discord.ui.Modal):
             return await i.response.send_message("No coins found. Try another name.", ephemeral=True)
         w.query = text
         await w._go(i, w.step)
-
-
-def money(x): return f"${x:,.2f}"
 
 
 def fmt(x): return f"{x:.8f}".rstrip("0").rstrip(".")
@@ -411,10 +575,10 @@ class MemoModal(discord.ui.Modal):
 
 class Wizard(discord.ui.View):
     """One message in the ticket: start (popular pairs) -> coin -> network -> coin -> network -> amount -> address -> confirm."""
-    TITLES = {"home": "Start a swap", "send": "Which coin are you sending?", "send_net": "Which network?",
-              "recv": "Which coin do you want to receive?", "recv_net": "Which network?",
-              "amount": "How much do you want to swap?", "address": "Where should we send it?",
-              "memo": "One more detail: memo / tag", "confirm": "Review your swap"}
+    TITLES = {"home": "💱 Start a swap", "send": "📤 Which coin are you sending?", "send_net": "🌐 Which network?",
+              "recv": "📥 Which coin do you want to receive?", "recv_net": "🌐 Which network?",
+              "amount": "💵 How much do you want to swap?", "address": "📮 Where should we send it?",
+              "memo": "🏷️ One more detail", "confirm": "🔎 Review your swap"}
     STEPNO = {"send": 1, "send_net": 1, "recv": 2, "recv_net": 2, "amount": 3, "address": 4, "memo": 4, "confirm": 5}
 
     def __init__(self, user, channel_id=None):
@@ -515,14 +679,15 @@ class Wizard(discord.ui.View):
         st = self.step
         n = self.STEPNO.get(st)
         e = discord.Embed(title=self.TITLES[st], color=GREEN if st == "confirm" else BLURPLE)
-        e.set_author(name="Crypto Swaps" if n is None else f"Crypto Swaps  ·  Step {n} of 5   {'▰' * n}{'▱' * (5 - n)}")
+        e.set_author(name=BRAND if n is None else f"{BRAND}  ·  Step {n} of 5   {'▰' * n}{'▱' * (5 - n)}")
         e.set_footer(text="Powered by FixedFloat" if st == "home" else
                      "Back returns to the previous step" if st in ("send", "recv", "send_net", "recv_net") else "Cancel starts over")
+        brand(e)
         lines = []
         if self.notice: lines.append(f"⚠️ **{self.notice}**")
         if st == "home":
-            lines.append("Pick a popular pair to start fast, or build your own swap. "
-                         "You'll type the amount in USD, then your address.")
+            lines.append("Pick a popular pair to start fast, or build your own swap.\n"
+                         "Next you'll type the amount in USD, then your address.")
         elif st in ("send", "recv"):
             _, total = coin_pool(st, self.query)
             lines.append(f"Choose the coin you want to **{'send' if st == 'send' else 'receive'}**, or use **🔍 Search**."
@@ -548,7 +713,7 @@ class Wizard(discord.ui.View):
                          "a wrong or missing one can lose funds.")
         else:
             lines.append("Check everything below, then press **Confirm swap**.")
-            e.set_footer(text=f"Rate: {RATE_TYPE} (the final amount can differ slightly)  ·  By confirming you accept the terms")
+            e.set_footer(text=f"Rate: {RATE_TYPE}  ·  the final amount can differ slightly")
         e.description = "\n\n".join(lines) or None
         if self.send:
             val = f"**{self.amount}** {short(self.send)}" if self.amount else short(self.send)
@@ -723,7 +888,7 @@ class Wizard(discord.ui.View):
                     await self.to_confirm(None)
             except discord.HTTPException:
                 waiting.pop(self.channel_id, None)
-                await m.channel.send(f"{m.author.mention} this menu expired. Press **Start swap** again.")
+                await m.channel.send(f"{m.author.mention} this menu expired. Press **Open menu** above.")
         finally:
             self.busy = False
 
@@ -735,8 +900,9 @@ class Wizard(discord.ui.View):
         if latest_order(i.channel_id):
             self.stop()
             return await i.response.edit_message(content="This ticket already has a swap.", embed=None, view=None)
-        await i.response.edit_message(embed=discord.Embed(title="⏳ Creating your order…", color=BLURPLE,
-                                                         description="Hang tight, this only takes a few seconds."), view=None)
+        await i.response.edit_message(embed=brand(discord.Embed(title="⏳ Creating your order…", color=BLURPLE,
+                                                               description="Hang tight, this only takes a few seconds.")),
+                                      view=None)
         try:
             params = dict(fromCcy=self.send, toCcy=self.recv, toAddress=self.address, amount=self.amount,
                           direction="from", type=RATE_TYPE)
@@ -752,18 +918,18 @@ class Wizard(discord.ui.View):
         self.stop()
         if not ok:
             print("MISMATCH", o.get("id"))
-            return await i.edit_original_response(view=None, embed=discord.Embed(
+            return await i.edit_original_response(view=None, embed=brand(discord.Embed(
                 title="🚫 Order didn't match your request", color=RED,
-                description="For safety I won't show a deposit address. **Do NOT send funds.** Press **Start swap** to try again."))
-        db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,NULL)",
-                   (o["id"], o["token"], i.user.id, i.channel_id, o["status"], time.time()))
+                description="For safety I won't show a deposit address. **Do NOT send funds.** Press **Open menu** to try again.")))
+        db.execute("INSERT INTO orders(id, token, user_id, channel_id, status, created, usd) VALUES(?,?,?,?,?,?,?)",
+                   (o["id"], o["token"], i.user.id, i.channel_id, o["status"], time.time(), self.usd))
         db.execute("INSERT OR REPLACE INTO addresses VALUES(?,?,?,?,?)",
                    (i.user.id, self.recv, self.address, self.memo, time.time())); db.commit()
         try:
             await i.channel.send(i.user.mention, embed=invoice_embed(o), view=EmergencyView())
-            await i.edit_original_response(view=None, embed=discord.Embed(
+            await i.edit_original_response(view=None, embed=brand(discord.Embed(
                 title="✅ Invoice posted below", color=GREEN,
-                description=f"Your {short(self.recv)} address was saved for next time. I'll post every update in this ticket."))
+                description=f"Your {short(self.recv)} address was saved for next time. I'll post every update in this ticket.")))
         except discord.HTTPException:
             await i.edit_original_response(embed=invoice_embed(o), view=None)
 
@@ -771,10 +937,11 @@ class Wizard(discord.ui.View):
 def invoice_embed(o):
     f, t = o["from"], o["to"]
     left = int(o.get("time", {}).get("left") or 0)
-    e = discord.Embed(title=f'🧾 Invoice · {short(f["code"])} ➜ {short(t["code"])}', color=GOLD, url=f'https://ff.io/order/{o["id"]}',
-                      description="Send the **exact amount** below to the **deposit address**. "
+    e = discord.Embed(title="🧾 Your invoice", color=GOLD, url=f'https://ff.io/order/{o["id"]}',
+                      description=f'**{short(f["code"])}** ➜ **{short(t["code"])}**\n'
+                                  "Send the **exact amount** to the **deposit address** below. "
                                   "Your swap starts automatically once the deposit arrives.")
-    e.set_author(name=f'Crypto Swaps  ·  Order {o["id"]}')
+    e.set_author(name=f'{BRAND}  ·  Order {o["id"]}')
     e.add_field(name="📤 Send exactly", value=f'```{f["amount"]} {f["code"]}```', inline=False)
     e.add_field(name="📮 Deposit address", value=f'```{f["address"]}```', inline=False)
     if f.get("tagValue"):
@@ -785,7 +952,7 @@ def invoice_embed(o):
     e.set_footer(text=f'⚠️ Send only {f["code"]} on the {f.get("network") or f["code"]} network. '
                       "A wrong amount, coin or network may delay or lose funds.")
     e.timestamp = discord.utils.utcnow()
-    return e
+    return brand(e)
 
 
 # ---------- emergency ----------
@@ -937,7 +1104,7 @@ def status_embed(o):
     f, t = o.get("from") or {}, o.get("to") or {}
     e = discord.Embed(title=f'{ICON.get(st, "ℹ️")} {STATUS.get(st, st)}', url=f'https://ff.io/order/{o["id"]}',
                       color=GREEN if st == "DONE" else RED if st in ("EXPIRED", "EMERGENCY") else BLURPLE)
-    e.set_author(name=f'Crypto Swaps  ·  Order {o["id"]}  ·  {short(f.get("code", "?"))} ➜ {short(t.get("code", "?"))}')
+    e.set_author(name=f'{BRAND}  ·  Order {o["id"]}  ·  {short(f.get("code", "?"))} ➜ {short(t.get("code", "?"))}')
     e.description = ("No deposit arrived in time, so this order was cancelled. Nothing was charged." if st == "EXPIRED" else
                      "This order needs your decision. Press the red **Something went wrong?** button." if st == "EMERGENCY"
                      else tracker(st))
@@ -949,7 +1116,7 @@ def status_embed(o):
         e.add_field(name="💰 You received", value=f'**{tout.get("amount") or t.get("amount")}** {t.get("code", "")}')
     if st in FINAL: e.set_footer(text=f"This ticket closes in {CLOSE_DELAY // 60} minutes.")
     e.timestamp = discord.utils.utcnow()
-    return e
+    return brand(e)
 
 
 async def notify(uid, ch_id, o):
@@ -984,11 +1151,14 @@ async def poll():
             close_at = time.time() + CLOSE_DELAY if o["status"] in FINAL else None
             db.execute("UPDATE orders SET status=?, close_at=? WHERE id=?", (o["status"], close_at, oid)); db.commit()
             await notify(uid, cid, o)
+            if o["status"] == "DONE": await update_panels()  # bump the Record line on the panel
         await asyncio.sleep(0.3)
 
 
 @poll.before_loop
-async def _wait(): await bot.wait_until_ready()
+async def _wait():
+    await bot.wait_until_ready()
+    await update_panels()  # sync the Record line on startup
 
 
 @tasks.loop(minutes=10)
