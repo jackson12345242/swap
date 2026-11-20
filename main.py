@@ -24,6 +24,10 @@ CHAT_INPUT = os.getenv("CHAT_INPUT", "1") == "1"  # type the USD amount in chat 
 BRAND = "JK's Crypto Exchange"
 BRAND_IMAGE = os.getenv("BRAND_IMAGE", "")  # direct image URL (upload the logo to Discord, copy its link)
 RULES_CHANNEL = int(os.getenv("RULES_CHANNEL", "1573162844189495336"))
+LOG_CHANNEL = int(os.getenv("LOG_CHANNEL", "1573179083678945301"))      # finished swaps are logged here
+VOUCH_CHANNEL = int(os.getenv("VOUCH_CHANNEL", "1573179083678945301"))  # where customers post +vouch
+VOUCH_REQUIRED = os.getenv("VOUCH_REQUIRED", "1") == "1" and CHAT_INPUT  # reading vouches needs Message Content Intent
+LOG_TXIDS = os.getenv("LOG_TXIDS", "0") == "1"  # also show tx ids in the log (it may be a public channel)
 TOS_TEXT = (
     "**By using this service you agree to the terms:** swaps are executed by a third party "
     "(FixedFloat). This bot never holds your funds. You are responsible for the receiving address, "
@@ -49,10 +53,14 @@ CREATE TABLE IF NOT EXISTS agreed(user_id INT PRIMARY KEY, ts REAL);
 
 
 def add_col(table, col, typ):  # tiny migration helper: safe to run on every start
-    try: db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
-    except sqlite3.OperationalError: pass
+    try: db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}"); return True
+    except sqlite3.OperationalError: return False
 
 
+add_col("orders", "vouch_text", "TEXT")   # the +vouch line we hand the customer
+add_col("orders", "log_msg", "INT")        # id of the swap-log message (edited when they vouch)
+if add_col("orders", "vouched", "INT DEFAULT 0"):
+    db.execute("UPDATE orders SET vouched=1")  # swaps from before vouching existed never block anyone
 add_col("orders", "usd", "REAL")          # USD value of each swap (for the panel record)
 add_col("config", "panel_channel", "INT")  # where the panel lives, so the record can be updated
 add_col("config", "panel_msg", "INT")
@@ -147,6 +155,8 @@ class PanelView(discord.ui.View):
         opening.add(uid)
         try:
             await i.response.defer(ephemeral=True)
+            pv = await pending_vouch(uid)  # must vouch for the last finished swap first
+            if pv: return await i.followup.send(embed=vouch_required_embed(pv), ephemeral=True)
             ow = {g.default_role: discord.PermissionOverwrite(view_channel=False),
                   g.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
                                                     embed_links=True, manage_channels=True,
@@ -177,6 +187,134 @@ class PanelView(discord.ui.View):
             return await i.response.send_message("Coin list is still loading, try again in a moment.", ephemeral=True)
         v = CoinsView()
         await i.response.send_message(embed=v.embed(), view=v, ephemeral=True)
+
+
+# ---------- vouches + swap log ----------
+def usd_text(x): return f"${x:,.0f}" if abs(x - round(x)) < 0.005 else f"${x:,.2f}"
+
+
+def swap_label(code):
+    c = next((c for c in ccies if c["code"] == code), None)
+    if not c: return (code or "?").lower()
+    t = ticker(c).lower()
+    return f'{t} {c["network"].lower()}' if c["network"] and multi_net(ticker(c)) else t
+
+
+def is_vouch(text): return (text or "").lstrip().lower().startswith("+vouch")
+
+
+async def mark_vouched(uid, upto):
+    """A +vouch posted at time `upto` clears every finished swap of that user made before it."""
+    rows = db.execute("SELECT id, log_msg FROM orders WHERE user_id=? AND status='DONE' AND vouched=0 "
+                      "AND created<=?", (uid, upto)).fetchall()
+    for oid, log_msg in rows:
+        db.execute("UPDATE orders SET vouched=1 WHERE id=?", (oid,)); db.commit()
+        ch = bot.get_channel(LOG_CHANNEL)
+        if ch and log_msg:
+            try:
+                msg = await ch.fetch_message(log_msg)
+                e = msg.embeds[0]
+                e.color = GREEN
+                e.set_footer(text="✅ Vouched")
+                await msg.edit(embed=e)
+            except (discord.HTTPException, IndexError): pass
+    return bool(rows)
+
+
+async def pending_vouch(uid):
+    """The +vouch line of the user's unvouched finished swap, or None. Scans the vouch channel first."""
+    if not VOUCH_REQUIRED: return None
+    q = ("SELECT vouch_text FROM orders WHERE user_id=? AND status='DONE' AND vouched=0 "
+         "ORDER BY created DESC LIMIT 1")
+    if not db.execute(q, (uid,)).fetchone(): return None
+    ch = bot.get_channel(VOUCH_CHANNEL)
+    if not ch:
+        print("vouch channel not visible, not enforcing vouches"); return None
+    try:
+        async for m in ch.history(limit=500):
+            if m.author.id == uid and is_vouch(m.content):
+                await mark_vouched(uid, m.created_at.timestamp()); break
+    except discord.HTTPException as e:
+        print("vouch scan failed", e); return None
+    r = db.execute(q, (uid,)).fetchone()
+    return (r[0] or "+vouch") if r else None
+
+
+def vouch_required_embed(text):
+    e = discord.Embed(title="⭐ Vouch first", color=GOLD, description=(
+        "Before you start another swap, please vouch for your last one.\n\n"
+        f"Paste this in <#{VOUCH_CHANNEL}>:\n```{text}```\nThen press **Start a swap** again."))
+    return brand(e)
+
+
+def thanks_embed(text):
+    e = discord.Embed(title="🎉 Thank you for swapping!", color=GREEN, description=(
+        "Your swap is complete. We'd really appreciate a vouch!\n\n"
+        f"1️⃣ Press **Vouch** below to get your message\n2️⃣ Paste it in <#{VOUCH_CHANNEL}>\n\n"
+        f"```{text}```"
+        + ("\n⚠️ You need to vouch before you can make another swap." if VOUCH_REQUIRED else "")))
+    return brand(e)
+
+
+class VouchView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        vc = bot.get_channel(VOUCH_CHANNEL)
+        if vc and getattr(vc, "guild", None):
+            self.add_item(discord.ui.Button(label="Go to vouches", style=discord.ButtonStyle.link,
+                                            url=f"https://discord.com/channels/{vc.guild.id}/{VOUCH_CHANNEL}"))
+
+    @discord.ui.button(label="Vouch", emoji="⭐", style=discord.ButtonStyle.success, custom_id="ff:vouch")
+    async def vouch(self, i: discord.Interaction, b):
+        r = db.execute("SELECT vouch_text FROM orders WHERE user_id=? AND status='DONE' AND vouch_text IS NOT NULL "
+                       "ORDER BY created DESC LIMIT 1", (i.user.id,)).fetchone()
+        if not r:
+            return await i.response.send_message("I couldn't find a finished swap for you.", ephemeral=True)
+        await i.response.send_message(r[0], ephemeral=True)  # plain text so it's easy to copy
+        await i.followup.send(f"Copy the message above and paste it in <#{VOUCH_CHANNEL}>. Thank you! 💙", ephemeral=True)
+
+
+async def send_thanks(uid, ch_id, o):
+    r = db.execute("SELECT vouch_text FROM orders WHERE id=?", (o["id"],)).fetchone()
+    if not r or not r[0]: return
+    e, view = thanks_embed(r[0]), VouchView()
+    try:
+        ch = bot.get_channel(ch_id) if ch_id else None
+        if ch: await ch.send(f"<@{uid}>", embed=e, view=view)
+        else: await (await bot.fetch_user(uid)).send(embed=e, view=view)
+    except discord.HTTPException as ex:
+        print("thanks failed", uid, o["id"], ex)
+
+
+def log_embed(uid, o, usd, vouched=False):
+    f, t = o.get("from") or {}, o.get("to") or {}
+    tx = o.get("tx") or {}
+    tin, tout = (tx.get("in") or {}), (tx.get("out") or {})
+    e = discord.Embed(title="✅ Swap completed", color=GREEN if vouched else GOLD, url=f'https://ff.io/order/{o["id"]}')
+    e.set_author(name=f'{BRAND}  ·  Order {o["id"]}')
+    e.add_field(name="👤 Customer", value=f"<@{uid}>\n`{uid}`")
+    e.add_field(name="💱 Pair", value=f'{short(f.get("code", "?"))} ➜ {short(t.get("code", "?"))}')
+    if usd: e.add_field(name="💵 Value", value=money(usd))
+    e.add_field(name="📤 Sent", value=f'**{f.get("amount", "?")}** {f.get("code", "")}', inline=False)
+    e.add_field(name="📥 Received", value=f'**{tout.get("amount") or t.get("amount", "?")}** {t.get("code", "")}')
+    if LOG_TXIDS:
+        if tin.get("id"): e.add_field(name="📥 Deposit TxID", value=f'```{tin["id"]}```', inline=False)
+        if tout.get("id"): e.add_field(name="📤 Payout TxID", value=f'```{tout["id"]}```', inline=False)
+    e.set_footer(text="✅ Vouched" if vouched else "⏳ Waiting for vouch")
+    e.timestamp = discord.utils.utcnow()
+    return brand(e)
+
+
+async def log_swap(uid, o):
+    ch = bot.get_channel(LOG_CHANNEL)
+    if not ch:
+        print("log channel not visible", LOG_CHANNEL); return
+    r = db.execute("SELECT usd FROM orders WHERE id=?", (o["id"],)).fetchone()
+    try:
+        m = await ch.send(embed=log_embed(uid, o, r[0] if r else None))
+        db.execute("UPDATE orders SET log_msg=? WHERE id=?", (m.id, o["id"])); db.commit()
+    except discord.HTTPException as ex:
+        print("log failed", o["id"], ex)
 
 
 # ---------- terms (first swap only) ----------
@@ -921,8 +1059,10 @@ class Wizard(discord.ui.View):
             return await i.edit_original_response(view=None, embed=brand(discord.Embed(
                 title="🚫 Order didn't match your request", color=RED,
                 description="For safety I won't show a deposit address. **Do NOT send funds.** Press **Open menu** to try again.")))
-        db.execute("INSERT INTO orders(id, token, user_id, channel_id, status, created, usd) VALUES(?,?,?,?,?,?,?)",
-                   (o["id"], o["token"], i.user.id, i.channel_id, o["status"], time.time(), self.usd))
+        vouch = f"+vouch {usd_text(self.usd)} {swap_label(self.send)} to {swap_label(self.recv)}"
+        db.execute("INSERT INTO orders(id, token, user_id, channel_id, status, created, usd, vouch_text) "
+                   "VALUES(?,?,?,?,?,?,?,?)",
+                   (o["id"], o["token"], i.user.id, i.channel_id, o["status"], time.time(), self.usd, vouch))
         db.execute("INSERT OR REPLACE INTO addresses VALUES(?,?,?,?,?)",
                    (i.user.id, self.recv, self.address, self.memo, time.time())); db.commit()
         try:
@@ -1128,6 +1268,7 @@ async def notify(uid, ch_id, o):
         else: await (await bot.fetch_user(uid)).send(embed=e)  # ticket gone: fall back to DM
     except discord.HTTPException as ex:
         print("notify failed", uid, o["id"], ex)
+    if st == "DONE": await send_thanks(uid, ch_id, o)
 
 
 @tasks.loop(seconds=20)
@@ -1151,7 +1292,9 @@ async def poll():
             close_at = time.time() + CLOSE_DELAY if o["status"] in FINAL else None
             db.execute("UPDATE orders SET status=?, close_at=? WHERE id=?", (o["status"], close_at, oid)); db.commit()
             await notify(uid, cid, o)
-            if o["status"] == "DONE": await update_panels()  # bump the Record line on the panel
+            if o["status"] == "DONE":
+                await log_swap(uid, o)     # swap details -> log channel
+                await update_panels()      # bump the Record line on the panel
         await asyncio.sleep(0.3)
 
 
@@ -1171,6 +1314,11 @@ async def refresh():
 @bot.event
 async def on_message(m: discord.Message):
     if m.author.bot or not m.guild: return
+    if VOUCH_REQUIRED and m.channel.id == VOUCH_CHANNEL and is_vouch(m.content):
+        if await mark_vouched(m.author.id, m.created_at.timestamp()):
+            try: await m.add_reaction("✅")
+            except discord.HTTPException: pass
+        return
     w = waiting.get(m.channel.id)
     if not w: return
     if w.is_finished(): waiting.pop(m.channel.id, None); return
@@ -1184,7 +1332,7 @@ async def setup_hook():
     session = aiohttp.ClientSession()
     await refresh()
     if not ccies: raise SystemExit("Could not load currencies: check FF_API_KEY / FF_API_SECRET")
-    for v in (PanelView(), TicketView(), EmergencyView()): bot.add_view(v)
+    for v in (PanelView(), TicketView(), EmergencyView(), VouchView()): bot.add_view(v)
     refresh.start(); poll.start()
     await bot.tree.sync()
 
