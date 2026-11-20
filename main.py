@@ -7,6 +7,7 @@ Env: DISCORD_TOKEN, FF_API_KEY, FF_API_SECRET, DB_PATH (on your Railway volume),
      RULES_CHANNEL (channel id people must read before swapping)
 """
 import os, re, math, hmac, hashlib, json, sqlite3, time, asyncio
+from datetime import datetime, timezone
 import aiohttp, discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -156,7 +157,9 @@ class PanelView(discord.ui.View):
         try:
             await i.response.defer(ephemeral=True)
             pv = await pending_vouch(uid)  # must vouch for the last finished swap first
-            if pv: return await i.followup.send(embed=vouch_required_embed(pv), ephemeral=True)
+            if pv:
+                await i.followup.send(embed=vouch_required_embed(pv), ephemeral=True)
+                return await i.followup.send(pv, ephemeral=True)  # plain text so it's easy to copy
             ow = {g.default_role: discord.PermissionOverwrite(view_channel=False),
                   g.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
                                                     embed_links=True, manage_channels=True,
@@ -221,22 +224,40 @@ async def mark_vouched(uid, upto):
     return bool(rows)
 
 
+_scan_errs: set = set()
+
+
+async def scan_vouches(uid=None):
+    """Read the vouch channel (and the log channel) and clear every customer who posted a +vouch after
+    their swap. Returns False if no channel could be read. Only looks back to the oldest pending swap."""
+    sql, args = "SELECT user_id, MIN(created) FROM orders WHERE status='DONE' AND vouched=0", ()
+    if uid: sql, args = sql + " AND user_id=?", (uid,)
+    pending = dict(db.execute(sql + " GROUP BY user_id", args).fetchall())
+    if not pending: return True
+    after = datetime.fromtimestamp(min(pending.values()) - 5, tz=timezone.utc)
+    ok = False
+    for cid in {VOUCH_CHANNEL, LOG_CHANNEL}:
+        try:
+            ch = bot.get_channel(cid) or await bot.fetch_channel(cid)
+            async for m in ch.history(limit=500, after=after, oldest_first=False):
+                if m.author.id in pending and is_vouch(m.content) \
+                        and await mark_vouched(m.author.id, m.created_at.timestamp()):
+                    try: await m.add_reaction("✅")
+                    except discord.HTTPException: pass
+            ok = True
+        except (discord.HTTPException, AttributeError) as e:
+            if (cid, str(e)) not in _scan_errs:  # print each distinct problem once, not every 5 seconds
+                _scan_errs.add((cid, str(e))); print("vouch scan failed", cid, e)
+    return ok
+
+
 async def pending_vouch(uid):
-    """The +vouch line of the user's unvouched finished swap, or None. Scans the vouch channel first."""
+    """The +vouch line of the user's unvouched finished swap, or None. Scans the channel first."""
     if not VOUCH_REQUIRED: return None
-    q = ("SELECT vouch_text FROM orders WHERE user_id=? AND status='DONE' AND vouched=0 "
-         "ORDER BY created DESC LIMIT 1")
-    if not db.execute(q, (uid,)).fetchone(): return None
-    ch = bot.get_channel(VOUCH_CHANNEL)
-    if not ch:
-        print("vouch channel not visible, not enforcing vouches"); return None
-    try:
-        async for m in ch.history(limit=500):
-            if m.author.id == uid and is_vouch(m.content):
-                await mark_vouched(uid, m.created_at.timestamp()); break
-    except discord.HTTPException as e:
-        print("vouch scan failed", e); return None
-    r = db.execute(q, (uid,)).fetchone()
+    if not await scan_vouches(uid):
+        print("vouch channel unreadable, not enforcing vouches"); return None
+    r = db.execute("SELECT vouch_text FROM orders WHERE user_id=? AND status='DONE' AND vouched=0 "
+                   "ORDER BY created DESC LIMIT 1", (uid,)).fetchone()
     return (r[0] or "+vouch") if r else None
 
 
@@ -1304,6 +1325,17 @@ async def _wait():
     await update_panels()  # sync the Record line on startup
 
 
+@tasks.loop(seconds=5)
+async def vouch_poll():
+    if not VOUCH_REQUIRED: return
+    try: await scan_vouches()
+    except Exception as e: print("vouch poll error", e)
+
+
+@vouch_poll.before_loop
+async def _wait_vouch(): await bot.wait_until_ready()
+
+
 @tasks.loop(minutes=10)
 async def refresh():
     global ccies
@@ -1314,7 +1346,7 @@ async def refresh():
 @bot.event
 async def on_message(m: discord.Message):
     if m.author.bot or not m.guild: return
-    if VOUCH_REQUIRED and m.channel.id == VOUCH_CHANNEL and is_vouch(m.content):
+    if VOUCH_REQUIRED and m.channel.id in (VOUCH_CHANNEL, LOG_CHANNEL) and is_vouch(m.content):
         if await mark_vouched(m.author.id, m.created_at.timestamp()):
             try: await m.add_reaction("✅")
             except discord.HTTPException: pass
@@ -1333,7 +1365,7 @@ async def setup_hook():
     await refresh()
     if not ccies: raise SystemExit("Could not load currencies: check FF_API_KEY / FF_API_SECRET")
     for v in (PanelView(), TicketView(), EmergencyView(), VouchView()): bot.add_view(v)
-    refresh.start(); poll.start()
+    refresh.start(); poll.start(); vouch_poll.start()
     await bot.tree.sync()
 
 
