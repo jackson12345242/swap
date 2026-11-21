@@ -25,7 +25,7 @@ CHAT_INPUT = os.getenv("CHAT_INPUT", "1") == "1"  # type the USD amount in chat 
 BRAND = "JK's Crypto Exchange"
 BRAND_IMAGE = os.getenv("BRAND_IMAGE", "https://imagepaste.org/i/s6vga5pa.jpg")  # logo; set BRAND_IMAGE to override
 RULES_CHANNEL = int(os.getenv("RULES_CHANNEL", "1573162844189495336"))
-LOG_CHANNEL = int(os.getenv("LOG_CHANNEL", "1573179083678945301"))      # finished swaps are logged here
+LOG_CHANNEL = int(os.getenv("LOG_CHANNEL", "1568114348952649809"))      # finished swaps are logged here
 VOUCH_CHANNEL = int(os.getenv("VOUCH_CHANNEL", "1560432284103086080"))  # where customers post +vouch
 VOUCH_REQUIRED = os.getenv("VOUCH_REQUIRED", "1") == "1" and CHAT_INPUT  # reading vouches needs Message Content Intent
 LOG_TXIDS = os.getenv("LOG_TXIDS", "0") == "1"  # also show tx ids in the log (it may be a public channel)
