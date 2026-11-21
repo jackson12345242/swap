@@ -216,11 +216,10 @@ async def mark_vouched(uid, upto):
         if ch and log_msg:
             try:
                 msg = await ch.fetch_message(log_msg)
-                e = msg.embeds[0]
-                e.color = GREEN
-                e.set_footer(text="✅ Vouched")
-                await msg.edit(embed=e)
-            except (discord.HTTPException, IndexError): pass
+                if "⏳ Waiting for vouch" in msg.content:
+                    await msg.edit(content=msg.content.replace("⏳ Waiting for vouch", "✅ Vouched"),
+                                   allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException: pass
     return bool(rows)
 
 
@@ -307,32 +306,56 @@ async def send_thanks(uid, ch_id, o):
         print("thanks failed", uid, o["id"], ex)
 
 
-def log_embed(uid, o, usd, vouched=False):
+# ---- coin emojis + USD helpers (used by the swap log, invoice, confirm screen and status updates)
+# Emojis are looked up BY NAME in every server the bot is in, so the bot must share a server with them.
+EMOJI = {"BTC": "Bitcoin", "LTC": "Litecoin", "SOL": "sol", "SUI": "SUI", "USDC": "USDC", "USDT": "usdt"}
+
+
+def coin_emoji(code):
+    c = next((c for c in ccies if c["code"] == code), None)
+    t = ticker(c) if c else (code or "")
+    name = "usdtbsc" if t == "USDT" and c and net_key(c["network"]) == "BEP20" else EMOJI.get(t)
+    em = discord.utils.get(bot.emojis, name=name) if name else None
+    return str(em) if em else "🪙"
+
+
+async def usd_of(code, amt):
+    """USD value of `amt` of coin `code`, or None if it can't be priced right now."""
+    try: return float(amt) * await coin_usd_price(code)
+    except (FFError, KeyError, TypeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError):
+        return None
+
+
+def amt_str(x):
+    try: return fmt(float(x))
+    except (TypeError, ValueError): return "?"
+
+
+async def log_text(uid, o):
     f, t = o.get("from") or {}, o.get("to") or {}
     tx = o.get("tx") or {}
     tin, tout = (tx.get("in") or {}), (tx.get("out") or {})
-    e = discord.Embed(title="✅ Swap completed", color=GREEN if vouched else GOLD, url=f'https://ff.io/order/{o["id"]}')
-    e.set_author(name=f'{BRAND}  ·  Order {o["id"]}')
-    e.add_field(name="👤 Customer", value=f"<@{uid}>\n`{uid}`")
-    e.add_field(name="💱 Pair", value=f'{short(f.get("code", "?"))} ➜ {short(t.get("code", "?"))}')
-    if usd: e.add_field(name="💵 Value", value=money(usd))
-    e.add_field(name="📤 Sent", value=f'**{f.get("amount", "?")}** {f.get("code", "")}', inline=False)
-    e.add_field(name="📥 Received", value=f'**{tout.get("amount") or t.get("amount", "?")}** {t.get("code", "")}')
+    f_amt, t_amt = f.get("amount"), tout.get("amount") or t.get("amount")
+    f_usd, t_usd = await usd_of(f.get("code"), f_amt), await usd_of(t.get("code"), t_amt)
+    lines = ["# Swap Complete✅",
+             f"👤 **Customer :** <@{uid}>", "",
+             f"{coin_emoji(f.get('code'))} **{amt_str(f_amt)} {ticker_of(f.get('code'))}** -> "
+             f"{coin_emoji(t.get('code'))} **{amt_str(t_amt)} {ticker_of(t.get('code'))}**"]
+    if f_usd is not None and t_usd is not None:
+        lines.append(f"-# {usd_text(f_usd)} -> {usd_text(t_usd)}")
+    lines.append(f"-# ticket id {o['id']}" + ("  ·  ⏳ Waiting for vouch" if VOUCH_REQUIRED else ""))
     if LOG_TXIDS:
-        if tin.get("id"): e.add_field(name="📥 Deposit TxID", value=f'```{tin["id"]}```', inline=False)
-        if tout.get("id"): e.add_field(name="📤 Payout TxID", value=f'```{tout["id"]}```', inline=False)
-    e.set_footer(text="✅ Vouched" if vouched else "⏳ Waiting for vouch")
-    e.timestamp = discord.utils.utcnow()
-    return brand(e)
+        if tin.get("id"): lines.append(f"-# deposit tx `{tin['id']}`")
+        if tout.get("id"): lines.append(f"-# payout tx `{tout['id']}`")
+    return "\n".join(lines)
 
 
 async def log_swap(uid, o):
     ch = bot.get_channel(LOG_CHANNEL)
     if not ch:
         print("log channel not visible", LOG_CHANNEL); return
-    r = db.execute("SELECT usd FROM orders WHERE id=?", (o["id"],)).fetchone()
     try:
-        m = await ch.send(embed=log_embed(uid, o, r[0] if r else None))
+        m = await ch.send(await log_text(uid, o), allowed_mentions=discord.AllowedMentions.none())
         db.execute("UPDATE orders SET log_msg=? WHERE id=?", (m.id, o["id"])); db.commit()
     except discord.HTTPException as ex:
         print("log failed", o["id"], ex)
@@ -746,7 +769,7 @@ class Wizard(discord.ui.View):
         self.step, self.query, self.notice, self.pair, self.saved = "home", "", None, False, None
         self.msg = None  # the menu message (so it can be resent at the bottom)
         self.send = self.recv = self.send_coin = self.recv_coin = None
-        self.amount = self.address = self.memo = self.est = self.limits = None
+        self.amount = self.address = self.memo = self.est = self.est_usd = self.limits = None
         self.render()
 
     async def interaction_check(self, i):
@@ -760,7 +783,7 @@ class Wizard(discord.ui.View):
     def reset(self):
         self.query, self.pair, self.usd = "", False, None
         self.send = self.recv = self.send_coin = self.recv_coin = None
-        self.amount = self.address = self.memo = self.est = self.limits = None
+        self.amount = self.address = self.memo = self.est = self.est_usd = self.limits = None
 
     def entries(self, side, tick):
         es = [c for c in ccies if c.get(side) and ticker(c) == tick]
@@ -879,7 +902,9 @@ class Wizard(discord.ui.View):
             if self.amount and self.usd: val += f"\n≈ {money(self.usd)}"
             e.add_field(name="📤 You send", value=val)
         if self.recv:
-            e.add_field(name="📥 You receive", value=f"≈ **{self.est}** {short(self.recv)}" if self.est else short(self.recv))
+            val = f"≈ **{self.est}** {short(self.recv)}" if self.est else short(self.recv)
+            if self.est and self.est_usd: val += f"\n≈ {money(self.est_usd)}"
+            e.add_field(name="📥 You receive", value=val)
         if st == "amount" and self.limits:
             mn, mx, mnc, mxc = self.limits
             parts = []
@@ -998,7 +1023,7 @@ class Wizard(discord.ui.View):
             self.amount = await usd_to_coin(self.send, usd)
             await self.refresh_quote()
         except (FFError, KeyError, ValueError, ZeroDivisionError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            self.amount = self.est = None
+            self.amount = self.est = self.est_usd = None
             if "FixedFloat's" in str(e): await self.load_limits()  # the shown limits may be out of date
             return f"Can't swap ${usd:,.2f}: {e}"
 
@@ -1006,6 +1031,7 @@ class Wizard(discord.ui.View):
         q = await ff("price", fromCcy=self.send, toCcy=self.recv, amount=self.amount, direction="from", type=RATE_TYPE)
         if q.get("errors"): raise FFError(ff_errors(q["errors"]))
         self.est = q["to"]["amount"]
+        self.est_usd = await usd_of(self.recv, self.est)  # USD value of what they'll receive (None if unpriceable)
 
     # ----- address / memo / typed input
     async def to_confirm(self, i):
@@ -1080,6 +1106,7 @@ class Wizard(discord.ui.View):
             return await i.edit_original_response(view=None, embed=brand(discord.Embed(
                 title="🚫 Order didn't match your request", color=RED,
                 description="For safety I won't show a deposit address. **Do NOT send funds.** Press **Open menu** to try again.")))
+        usd_recv = await usd_of(o["to"]["code"], o["to"]["amount"])  # USD value of the estimated payout
         vouch = f"+vouch {usd_text(self.usd)} {swap_label(self.send)} to {swap_label(self.recv)}"
         db.execute("INSERT INTO orders(id, token, user_id, channel_id, status, created, usd, vouch_text) "
                    "VALUES(?,?,?,?,?,?,?,?)",
@@ -1087,15 +1114,15 @@ class Wizard(discord.ui.View):
         db.execute("INSERT OR REPLACE INTO addresses VALUES(?,?,?,?,?)",
                    (i.user.id, self.recv, self.address, self.memo, time.time())); db.commit()
         try:
-            await i.channel.send(i.user.mention, embed=invoice_embed(o), view=EmergencyView())
+            await i.channel.send(i.user.mention, embed=invoice_embed(o, self.usd, usd_recv), view=EmergencyView())
             await i.edit_original_response(view=None, embed=brand(discord.Embed(
                 title="✅ Invoice posted below", color=GREEN,
                 description=f"Your {short(self.recv)} address was saved for next time. I'll post every update in this ticket.")))
         except discord.HTTPException:
-            await i.edit_original_response(embed=invoice_embed(o), view=None)
+            await i.edit_original_response(embed=invoice_embed(o, self.usd, usd_recv), view=None)
 
 
-def invoice_embed(o):
+def invoice_embed(o, usd_send=None, usd_recv=None):
     f, t = o["from"], o["to"]
     left = int(o.get("time", {}).get("left") or 0)
     e = discord.Embed(title="🧾 Your invoice", color=GOLD, url=f'https://ff.io/order/{o["id"]}',
@@ -1103,11 +1130,13 @@ def invoice_embed(o):
                                   "Send the **exact amount** to the **deposit address** below. "
                                   "Your swap starts automatically once the deposit arrives.")
     e.set_author(name=f'{BRAND}  ·  Order {o["id"]}')
-    e.add_field(name="📤 Send exactly", value=f'```{f["amount"]} {f["code"]}```', inline=False)
+    send_val = f'```{f["amount"]} {f["code"]}```' + (f"≈ **{money(usd_send)}**" if usd_send else "")
+    e.add_field(name="📤 Send exactly", value=send_val, inline=False)
     e.add_field(name="📮 Deposit address", value=f'```{f["address"]}```', inline=False)
     if f.get("tagValue"):
         e.add_field(name=f'🏷️ Deposit {f.get("tag") or "memo"} (required)', value=f'```{f["tagValue"]}```', inline=False)
-    e.add_field(name="📥 You receive (est.)", value=f'**{t["amount"]}** {t["code"]}')
+    recv_val = f'**{t["amount"]}** {t["code"]}' + (f"\n≈ {money(usd_recv)}" if usd_recv else "")
+    e.add_field(name="📥 You receive (est.)", value=recv_val)
     if left: e.add_field(name="⏳ Expires", value=f"<t:{int(time.time()) + left}:R>")
     e.add_field(name="🏦 Payout address", value=f'`{t["address"]}`', inline=False)
     e.set_footer(text=f'⚠️ Send only {f["code"]} on the {f.get("network") or f["code"]} network. '
@@ -1260,7 +1289,7 @@ def tracker(st):
     return "  ›  ".join(("✅" if k < n else "🔵" if k == n else "⚪") + f" {name}" for k, name in enumerate(FLOW))
 
 
-def status_embed(o):
+def status_embed(o, usd=None):
     st = o["status"]
     f, t = o.get("from") or {}, o.get("to") or {}
     e = discord.Embed(title=f'{ICON.get(st, "ℹ️")} {STATUS.get(st, st)}', url=f'https://ff.io/order/{o["id"]}',
@@ -1274,7 +1303,8 @@ def status_embed(o):
     if tin.get("id"): e.add_field(name="📥 Deposit TxID", value=f'```{tin["id"]}```', inline=False)
     if tout.get("id"):
         e.add_field(name="📤 Payout TxID", value=f'```{tout["id"]}```', inline=False)
-        e.add_field(name="💰 You received", value=f'**{tout.get("amount") or t.get("amount")}** {t.get("code", "")}')
+        e.add_field(name="💰 You received", value=f'**{tout.get("amount") or t.get("amount")}** {t.get("code", "")}'
+                    + (f"\n≈ {money(usd)}" if usd else ""))
     if st in FINAL: e.set_footer(text=f"This ticket closes in {CLOSE_DELAY // 60} minutes.")
     e.timestamp = discord.utils.utcnow()
     return brand(e)
@@ -1282,7 +1312,10 @@ def status_embed(o):
 
 async def notify(uid, ch_id, o):
     st = o["status"]
-    e = status_embed(o)
+    tout = (o.get("tx") or {}).get("out") or {}
+    t = o.get("to") or {}
+    usd = await usd_of(t.get("code"), tout.get("amount") or t.get("amount")) if tout.get("id") else None
+    e = status_embed(o, usd)
     try:
         ch = bot.get_channel(ch_id) if ch_id else None
         if ch: await ch.send(f"<@{uid}>", embed=e, view=None if st in FINAL else EmergencyView())
