@@ -6,7 +6,7 @@ Env: DISCORD_TOKEN, FF_API_KEY, FF_API_SECRET, DB_PATH (on your Railway volume),
      BRAND_IMAGE (direct URL of your logo, shown as a thumbnail on every embed),
      RULES_CHANNEL (channel id people must read before swapping)
 """
-import os, re, math, hmac, hashlib, json, sqlite3, time, asyncio
+import os, re, math, hmac, hashlib, json, sqlite3, time, asyncio, traceback
 from datetime import datetime, timezone
 import aiohttp, discord
 from discord import app_commands
@@ -138,6 +138,26 @@ async def update_panels():
         except discord.HTTPException as e: print("panel update failed", e)
 
 
+async def post_ticket(ch, user):
+    """Post the welcome message and the swap menu in a ticket channel.
+    Returns None on success, or a readable error (also printed, with details, to the Railway logs)."""
+    perms = ch.permissions_for(ch.guild.me)
+    missing = [n.replace("_", " ") for n in ("view_channel", "send_messages", "embed_links") if not getattr(perms, n)]
+    if missing:
+        print("ticket setup failed: I'm missing permissions in", ch.id, missing)
+        return "I'm missing these permissions in the ticket: " + ", ".join(missing) + "."
+    try:
+        e = discord.Embed(title="🎫 Your private swap ticket", color=BLURPLE, description=(
+            "Only you and staff can see this channel.\n"
+            f"📖 Read <#{RULES_CHANNEL}> before your swap.\n\n"
+            "Your swap menu is right below. Lost it? Press **Open menu**."))
+        await ch.send(user.mention, embed=brand(e), view=TicketView())
+        await send_menu(ch, user)  # terms first if this is their first swap, otherwise straight to the menu
+    except Exception as ex:
+        traceback.print_exc()
+        return f"{type(ex).__name__}: {ex}"
+
+
 class PanelView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
 
@@ -149,7 +169,14 @@ class PanelView(discord.ui.View):
             return await i.response.send_message("Not set up yet. An admin must run /setup.", ephemeral=True)
         row = db.execute("SELECT channel_id FROM tickets WHERE user_id=? AND guild_id=?", (uid, g.id)).fetchone()
         if row:
-            if g.get_channel(row[0]):
+            old = g.get_channel(row[0])
+            if old and getattr(old, "last_message_id", None) is None and not latest_order(old.id):
+                # an EMPTY ticket (its first messages never got posted): post them now instead of refusing
+                await i.response.defer(ephemeral=True)
+                err = await post_ticket(old, i.user)
+                return await i.followup.send(f"Couldn't set up your ticket: {err}" if err
+                                             else f"Your ticket is ready: {old.mention}", ephemeral=True)
+            if old:
                 return await i.response.send_message(f"You already have a ticket: <#{row[0]}>", ephemeral=True)
             db.execute("DELETE FROM tickets WHERE channel_id=?", (row[0],)); db.commit()
         if uid in opening: return await i.response.defer()
@@ -174,12 +201,12 @@ class PanelView(discord.ui.View):
             except discord.HTTPException as e:
                 return await i.followup.send(f"Couldn't create your ticket: {e}", ephemeral=True)
             db.execute("INSERT INTO tickets VALUES(?,?,?,?)", (ch.id, uid, g.id, time.time())); db.commit()
-            e = discord.Embed(title="🎫 Your private swap ticket", color=BLURPLE, description=(
-                "Only you and staff can see this channel.\n"
-                f"📖 Read <#{RULES_CHANNEL}> before your swap.\n\n"
-                "Your swap menu is right below. Lost it? Press **Open menu**."))
-            await ch.send(i.user.mention, embed=brand(e), view=TicketView())
-            await send_menu(ch, i.user)  # terms first if this is their first swap, otherwise straight to the menu
+            err = await post_ticket(ch, i.user)  # welcome message + swap menu (or terms on the first swap)
+            if err:  # don't leave a dead, empty ticket behind
+                db.execute("DELETE FROM tickets WHERE channel_id=?", (ch.id,)); db.commit()
+                try: await ch.delete(reason="ticket setup failed")
+                except discord.HTTPException: pass
+                return await i.followup.send(f"Couldn't set up your ticket: {err}", ephemeral=True)
             await i.followup.send(f"Your ticket: {ch.mention}", ephemeral=True)
         finally:
             opening.discard(uid)
