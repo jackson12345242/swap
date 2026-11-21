@@ -216,7 +216,11 @@ async def mark_vouched(uid, upto):
         if ch and log_msg:
             try:
                 msg = await ch.fetch_message(log_msg)
-                if "⏳ Waiting for vouch" in msg.content:
+                emb = msg.embeds[0] if msg.embeds else None
+                if emb and "⏳ Waiting for vouch" in (emb.description or ""):
+                    emb.description = emb.description.replace("⏳ Waiting for vouch", "✅ Vouched")
+                    await msg.edit(embed=emb)
+                elif "⏳ Waiting for vouch" in msg.content:  # older plain-text log messages
                     await msg.edit(content=msg.content.replace("⏳ Waiting for vouch", "✅ Vouched"),
                                    allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException: pass
@@ -331,14 +335,13 @@ def amt_str(x):
     except (TypeError, ValueError): return "?"
 
 
-async def log_text(uid, o):
+async def log_embed(uid, o):
     f, t = o.get("from") or {}, o.get("to") or {}
     tx = o.get("tx") or {}
     tin, tout = (tx.get("in") or {}), (tx.get("out") or {})
     f_amt, t_amt = f.get("amount"), tout.get("amount") or t.get("amount")
     f_usd, t_usd = await usd_of(f.get("code"), f_amt), await usd_of(t.get("code"), t_amt)
-    lines = ["# Swap Complete✅",
-             f"👤 **Customer :** <@{uid}>", "",
+    lines = [f"👤 **Customer :** <@{uid}>", "",
              f"{coin_emoji(f.get('code'))} **{amt_str(f_amt)} {ticker_of(f.get('code'))}** -> "
              f"{coin_emoji(t.get('code'))} **{amt_str(t_amt)} {ticker_of(t.get('code'))}**"]
     if f_usd is not None and t_usd is not None:
@@ -347,7 +350,7 @@ async def log_text(uid, o):
     if LOG_TXIDS:
         if tin.get("id"): lines.append(f"-# deposit tx `{tin['id']}`")
         if tout.get("id"): lines.append(f"-# payout tx `{tout['id']}`")
-    return "\n".join(lines)
+    return discord.Embed(title="Swap Complete✅", description="\n".join(lines), color=0xFFFFFF)  # white
 
 
 async def log_swap(uid, o):
@@ -355,7 +358,7 @@ async def log_swap(uid, o):
     if not ch:
         print("log channel not visible", LOG_CHANNEL); return
     try:
-        m = await ch.send(await log_text(uid, o), allowed_mentions=discord.AllowedMentions.none())
+        m = await ch.send(embed=await log_embed(uid, o))
         db.execute("UPDATE orders SET log_msg=? WHERE id=?", (m.id, o["id"])); db.commit()
     except discord.HTTPException as ex:
         print("log failed", o["id"], ex)
