@@ -23,7 +23,7 @@ BLURPLE, GREEN, GOLD, RED = 0x5865F2, 0x57F287, 0xFEE75C, 0xED4245
 MIN_BUFFER_USD = float(os.getenv("MIN_BUFFER_USD", "0.01"))  # added on top of FixedFloat's minimum
 CHAT_INPUT = os.getenv("CHAT_INPUT", "1") == "1"  # type the USD amount in chat (needs Message Content Intent)
 BRAND = "JK's Crypto Exchange"
-BRAND_IMAGE = os.getenv("BRAND_IMAGE", "")  # direct image URL (upload the logo to Discord, copy its link)
+BRAND_IMAGE = os.getenv("BRAND_IMAGE", "https://imagepaste.org/i/s6vga5pa.jpg")  # logo; set BRAND_IMAGE to override
 RULES_CHANNEL = int(os.getenv("RULES_CHANNEL", "1573162844189495336"))
 LOG_CHANNEL = int(os.getenv("LOG_CHANNEL", "1573179083678945301"))      # finished swaps are logged here
 VOUCH_CHANNEL = int(os.getenv("VOUCH_CHANNEL", "1573179083678945301"))  # where customers post +vouch
